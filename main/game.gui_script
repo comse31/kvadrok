@@ -1,0 +1,537 @@
+local game = require("main.game")
+
+local N = game.W
+local M = game.H
+local ZONE = game.ZONE
+local ZONE_X = game.ZONE_X
+local ZONE_Y = game.ZONE_Y
+
+-- Отступы интерфейса — в долях от размера сцены, чтобы пропорции не зависели
+-- от разрешения и масштаба экрана.
+local MARGIN_TOP_R = 0.165   -- 132 px при высоте 800
+local MARGIN_BOTTOM_R = 0.145 -- 116 px при высоте 800
+local MARGIN_SIDE_R = 0.048  -- 20 px при ширине 420
+
+-- Минимальная длина свайпа — в долях от стороны игрового поля.
+local SWIPE_MIN_R = 0.055
+
+-- Разрешение одной клетки в текстуре поля.
+local CELL_PX = 8
+
+local TEX_ID = "board_tx"
+local TEX_W = N * CELL_PX
+local TEX_H = M * CELL_PX
+
+-- Толщина контура и свечения — в долях от размера клетки поля.
+local FRAME_T_R = 0.26
+local FRAME_GLOW_T_R = 1.05
+local FRAME_GLOW_ALPHA = 0.16
+
+-- Палитра клеток (RGB 0..255).
+local CELL_RGB = {
+	{ 61, 199, 240 },
+	{ 250, 209, 69 },
+	{ 184, 117, 242 },
+	{ 92, 219, 133 },
+	{ 245, 112, 112 },
+	{ 97, 148, 250 },
+	{ 250, 158, 71 },
+}
+
+-- Цвет фона поля и пустых клеток (сетка не рисуется).
+local RGB_EMPTY = { 21, 27, 39 }
+-- Чуть более светлый фон клеток внутри зоны появления.
+local RGB_ZONE = { 28, 36, 52 }
+
+-- Цвета контура: зелёный -> жёлтый -> красный.
+local COLOR_OK = { 62, 226, 124 }
+local COLOR_WARN = { 246, 212, 66 }
+local COLOR_BAD = { 246, 62, 62 }
+
+local COLOR_TEXT = vmath.vector4(0.92, 0.95, 1.0, 1.0)
+local COLOR_TEXT_DIM = vmath.vector4(0.60, 0.67, 0.80, 1.0)
+
+local function rgb_str(rgb)
+	return string.char(rgb[1], rgb[2], rgb[3])
+end
+
+--- Собирает блок CELL_PX x CELL_PX без рамки: мягкий объём по вертикали.
+local function make_block(rgb)
+	local r, g, b = rgb[1], rgb[2], rgb[3]
+	local function clamp(v)
+		if v < 0 then return 0 elseif v > 255 then return 255 end
+		return math.floor(v)
+	end
+
+	local top = rgb_str({ clamp(r * 1.12), clamp(g * 1.12), clamp(b * 1.12) })
+	local fill = rgb_str(rgb)
+	local bottom = rgb_str({ clamp(r * 0.82), clamp(g * 0.82), clamp(b * 0.82) })
+
+	local rows = { string.rep(top, CELL_PX) }
+	for _ = 2, CELL_PX - 1 do
+		rows[#rows + 1] = string.rep(fill, CELL_PX)
+	end
+	rows[#rows + 1] = string.rep(bottom, CELL_PX)
+	return rows
+end
+
+--- Ровный блок CELL_PX x CELL_PX без градиента (для фона поля).
+local function make_flat_block(rgb)
+	local line = string.rep(rgb_str(rgb), CELL_PX)
+	local rows = {}
+	for i = 1, CELL_PX do
+		rows[i] = line
+	end
+	return rows
+end
+
+--- Таблица блоков: ключ — вид клетки, значение — массив строк (пиксели).
+local BLOCKS = {}
+
+local function block_for(key, rgb)
+	local block = BLOCKS[key]
+	if not block then
+		block = make_block(rgb)
+		BLOCKS[key] = block
+	end
+	return block
+end
+
+local function prepare_blocks()
+	BLOCKS.empty = make_flat_block(RGB_EMPTY)
+	BLOCKS.zone = make_flat_block(RGB_ZONE)
+	for i = 1, #CELL_RGB do
+		block_for("c" .. i, CELL_RGB[i])
+	end
+end
+
+--- Собирает буфер текстуры по текущему состоянию поля.
+local function build_buffer(self)
+	local rows = {}
+	local board = self.board
+	local piece = self.piece
+
+	-- Карта клеток текущей фигуры для быстрого поиска.
+	local overlay = {}
+	if piece then
+		for i = 1, #piece.cells do
+			local cx = piece.x + piece.cells[i][1]
+			local cy = piece.y + piece.cells[i][2]
+			overlay[cy * N + cx] = piece.color
+		end
+	end
+
+	local empty_block = BLOCKS.empty
+	local zone_block = BLOCKS.zone
+
+	for y = 0, M - 1 do
+		local row = board[y]
+		-- Строки текстуры, соответствующие этому ряду клеток.
+		local buffers = {}
+		for i = 0, CELL_PX - 1 do
+			buffers[i] = {}
+		end
+
+		for x = 0, N - 1 do
+			local index = overlay[y * N + x] or row[x]
+			local block
+			if index == 0 then
+				if x >= ZONE_X and x < ZONE_X + ZONE
+					and y >= ZONE_Y and y < ZONE_Y + ZONE then
+					block = zone_block
+				else
+					block = empty_block
+				end
+			else
+				block = BLOCKS["c" .. index] or empty_block
+			end
+			for i = 0, CELL_PX - 1 do
+				local line = buffers[i]
+				line[#line + 1] = block[i + 1]
+			end
+		end
+
+		for i = 0, CELL_PX - 1 do
+			rows[#rows + 1] = table.concat(buffers[i])
+		end
+	end
+
+	return table.concat(rows)
+end
+
+local function upload_board(self)
+	if not self.board_node then
+		return
+	end
+	local ok = gui.set_texture_data(TEX_ID, TEX_W, TEX_H, "rgb", build_buffer(self), false)
+	if not ok then
+		print("Не удалось обновить текстуру поля")
+	end
+end
+
+local function make_box(pos, size, color)
+	local node = gui.new_box_node(pos, size)
+	gui.set_pivot(node, gui.PIVOT_SW)
+	gui.set_adjust_mode(node, gui.ADJUST_STRETCH)
+	gui.set_color(node, color)
+	return node
+end
+
+local function make_label(pos, text, pivot, color)
+	local node = gui.new_text_node(pos, text)
+	gui.set_font(node, "main")
+	gui.set_pivot(node, pivot)
+	gui.set_adjust_mode(node, gui.ADJUST_STRETCH)
+	gui.set_color(node, color or COLOR_TEXT)
+	return node
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+--- Цвет контура для значения опасности 0..1.
+local function danger_color(value)
+	local from, to, t
+	if value < 0.5 then
+		from, to, t = COLOR_OK, COLOR_WARN, value / 0.5
+	else
+		from, to, t = COLOR_WARN, COLOR_BAD, (value - 0.5) / 0.5
+	end
+	return vmath.vector4(
+		lerp(from[1], to[1], t) / 255,
+		lerp(from[2], to[2], t) / 255,
+		lerp(from[3], to[3], t) / 255,
+		1
+	)
+end
+
+--- Пересчитывает геометрию поля под текущий размер сцены.
+--- Поле всегда квадратное, а все его элементы масштабируются вместе с ним.
+local function relayout(self)
+	local w = gui.get_width()
+	local h = gui.get_height()
+
+	local margin_top = h * MARGIN_TOP_R
+	local margin_bottom = h * MARGIN_BOTTOM_R
+	local margin_side = w * MARGIN_SIDE_R
+
+	local avail_w = w - margin_side * 2
+	local avail_h = h - margin_top - margin_bottom
+	local size = math.max(64, math.min(avail_w, avail_h))
+
+	self.cell = size / N
+	self.board_size = size
+	self.origin_x = (w - size) / 2
+	self.origin_y = margin_bottom + math.max(0, (avail_h - size) / 2)
+
+	self.margin_top = margin_top
+	self.margin_bottom = margin_bottom
+	self.swipe_min = size * SWIPE_MIN_R
+	-- Толщины линий контура пропорциональны клетке поля.
+	self.frame_t = math.max(1.5, self.cell * FRAME_T_R)
+	self.frame_glow_t = math.max(self.frame_t, self.cell * FRAME_GLOW_T_R)
+
+	self.scene_w = w
+	self.scene_h = h
+end
+
+local function build_board_node(self)
+	if self.board_node then
+		gui.delete_node(self.board_node)
+	end
+
+	if not self.texture_ready then
+		local ok = gui.new_texture(TEX_ID, TEX_W, TEX_H, "rgb", string.rep(string.char(0), TEX_W * TEX_H * 3))
+		if not ok then
+			print("Не удалось создать текстуру поля")
+			return
+		end
+		self.texture_ready = true
+	end
+
+	self.board_node = make_box(
+		vmath.vector3(self.origin_x, self.origin_y, 0.05),
+		vmath.vector3(self.board_size, self.board_size, 0),
+		vmath.vector4(1, 1, 1, 1)
+	)
+	gui.set_texture(self.board_node, TEX_ID)
+end
+
+--- Удаляет узлы контура зоны.
+local function clear_frame(self)
+	if self.frame then
+		for i = 1, #self.frame do
+			gui.delete_node(self.frame[i])
+		end
+		self.frame = nil
+	end
+end
+
+--- Создаёт подложку и контур центральной зоны появления фигур.
+local function build_frame(self)
+	clear_frame(self)
+
+	local zx = self.origin_x + ZONE_X * self.cell
+	local zy = self.origin_y + ZONE_Y * self.cell
+	local zs = ZONE * self.cell
+
+	local t = self.frame_t
+	local g = self.frame_glow_t
+	local color = danger_color(self.danger or 0)
+	local glow = vmath.vector4(color.x, color.y, color.z, FRAME_GLOW_ALPHA)
+
+	local bars = {
+		{ zx - t / 2, zy - t / 2, zs + t, t }, -- нижняя
+		{ zx - t / 2, zy + zs - t / 2, zs + t, t }, -- верхняя
+		{ zx - t / 2, zy - t / 2, t, zs + t }, -- левая
+		{ zx + zs - t / 2, zy - t / 2, t, zs + t }, -- правая
+	}
+
+	local glows = {
+		{ zx - g / 2, zy - g / 2, zs + g, g },
+		{ zx - g / 2, zy + zs - g / 2, zs + g, g },
+		{ zx - g / 2, zy - g / 2, g, zs + g },
+		{ zx + zs - g / 2, zy - g / 2, g, zs + g },
+	}
+
+	local nodes = {}
+	for i = 1, #glows do
+		local b = glows[i]
+		nodes[#nodes + 1] = make_box(vmath.vector3(b[1], b[2], 0.25), vmath.vector3(b[3], b[4], 0), glow)
+	end
+	for i = 1, #bars do
+		local b = bars[i]
+		nodes[#nodes + 1] = make_box(vmath.vector3(b[1], b[2], 0.3), vmath.vector3(b[3], b[4], 0), color)
+	end
+
+	self.frame = nodes
+end
+
+--- Перекрашивает контур зоны под текущее значение опасности.
+local function update_frame(self)
+	if not self.frame then
+		return
+	end
+	local color = danger_color(self.danger or 0)
+	local glow = vmath.vector4(color.x, color.y, color.z, FRAME_GLOW_ALPHA)
+	-- [1..4] — свечение, [5..8] — сам контур.
+	for i = 1, 4 do
+		gui.set_color(self.frame[i], glow)
+	end
+	for i = 5, #self.frame do
+		gui.set_color(self.frame[i], color)
+	end
+end
+
+--- HUD: позиции в долях размера сцены, шрифт масштабируется вместе с полем.
+local function build_hud(self)
+	local w = self.scene_w
+	local h = self.scene_h
+
+	if self.title then
+		gui.delete_node(self.title)
+		gui.delete_node(self.score)
+		gui.delete_node(self.hint)
+		gui.delete_node(self.status)
+	end
+
+	-- Размер шрифта пропорционален стороне поля (22 px при поле ~420 px).
+	local scale = math.max(0.6, self.board_size / 420)
+
+	self.title = make_label(vmath.vector3(w / 2, h - h * 0.065, 0.1), "КВАДРОК", gui.PIVOT_N, COLOR_TEXT)
+	self.score = make_label(vmath.vector3(w / 2, h - h * 0.11, 0.1), "", gui.PIVOT_N, COLOR_TEXT_DIM)
+	self.status = make_label(vmath.vector3(w / 2, h * 0.095, 0.1), "", gui.PIVOT_S, COLOR_TEXT_DIM)
+	self.hint = make_label(vmath.vector3(w / 2, h * 0.055, 0.1), "Свайп в сторону", gui.PIVOT_S, COLOR_TEXT)
+
+	local labels = { self.title, self.score, self.status, self.hint }
+	for i = 1, #labels do
+		gui.set_scale(labels[i], vmath.vector3(scale, scale, 1))
+	end
+end
+
+local function update_hud(self)
+	if self.points ~= self.shown_points then
+		self.shown_points = self.points
+		gui.set_text(self.score, "Очки: " .. tostring(self.points))
+	end
+
+	if self.state == "gameover" then
+		return
+	end
+
+	local pct = math.floor((self.danger or 0) * 100 + 0.5)
+	if pct ~= self.shown_pct then
+		self.shown_pct = pct
+		gui.set_text(self.status, "Угроза: " .. tostring(pct) .. "%")
+	end
+end
+
+local function refresh(self)
+	if self.state ~= "gameover" then
+		self.danger_target = game.danger(self.board)
+	end
+	upload_board(self)
+	update_hud(self)
+end
+
+--- Появление новой фигуры в центре зоны.
+local function spawn(self)
+	local piece = game.random_piece()
+	local x, y = game.spawn_pos(piece)
+
+	if not game.can_place(self.board, piece.cells, x, y) then
+		self.state = "gameover"
+		self.piece = nil
+		self.danger_target = 1
+		self.danger = 1
+		gui.set_text(self.hint, "Свайп — новая игра")
+		gui.set_text(self.status, "Зона занята")
+		refresh(self)
+		return
+	end
+
+	piece.x = x
+	piece.y = y
+	self.piece = piece
+	refresh(self)
+end
+
+--- Свайп: фигура едет до упора. Если она всё ещё пересекает контур — конец игры.
+local function commit_swipe(self, side)
+	local piece = self.piece
+	if not piece then
+		return
+	end
+
+	local dx, dy = game.side_delta(side)
+	local nx, ny = game.slide(self.board, piece.cells, piece.x, piece.y, dx, dy)
+
+	if game.overlaps_zone(piece.cells, nx, ny) then
+		-- Фигура не смогла выйти из зоны — она пересекает контур.
+		game.place(self.board, piece.cells, nx, ny, piece.color)
+		self.piece = nil
+		self.state = "gameover"
+		self.danger_target = 1
+		gui.set_text(self.hint, "Свайп — новая игра")
+		gui.set_text(self.status, "Контур пересечён")
+		refresh(self)
+		return
+	end
+
+	game.place(self.board, piece.cells, nx, ny, piece.color)
+	self.piece = nil
+	spawn(self)
+end
+
+local function side_from_swipe(dx, dy)
+	if math.abs(dx) > math.abs(dy) then
+		if dx < 0 then
+			return game.SIDE_LEFT
+		end
+		return game.SIDE_RIGHT
+	end
+	if dy < 0 then
+		return game.SIDE_BOTTOM
+	end
+	return game.SIDE_TOP
+end
+
+local function restart(self)
+	self.board = game.new_board()
+	self.points = 0
+	self.danger = 0
+	self.danger_target = 0
+	self.shown_pct = nil
+	self.shown_points = nil
+	self.state = "play"
+	gui.set_text(self.hint, "Свайп в сторону")
+	spawn(self)
+end
+
+function init(self)
+	self.points = 0
+	self.state = "play"
+	self.board = game.new_board()
+	self.danger = 0
+	self.danger_target = 0
+	self.shown_pct = nil
+	self.shown_points = nil
+
+	prepare_blocks()
+	relayout(self)
+	build_board_node(self)
+	build_hud(self)
+	build_frame(self)
+	spawn(self)
+
+	msg.post(".", "acquire_input_focus")
+end
+
+function update(self, dt)
+	local target = self.danger_target or 0
+
+	-- Плавное приближение к целевому значению.
+	local step = math.min(1, dt * 3)
+	local next_value = self.danger + (target - self.danger) * step
+	if math.abs(next_value - self.danger) < 0.0005 then
+		next_value = target
+	end
+
+	if next_value ~= self.danger then
+		self.danger = next_value
+		update_frame(self)
+		update_hud(self)
+	end
+end
+
+function on_input(self, action_id, action)
+	if action_id ~= hash("touch") then
+		return false
+	end
+
+	if action.pressed then
+		self.pointer_id = action.id
+		self.pointer_start = vmath.vector3(action.screen_x, action.screen_y, 0)
+		return true
+	end
+
+	if action.released then
+		if self.pointer_id ~= nil and action.id ~= self.pointer_id then
+			return true
+		end
+		self.pointer_id = nil
+
+		local start = self.pointer_start
+		self.pointer_start = nil
+		if not start then
+			return true
+		end
+
+		local dx = action.screen_x - start.x
+		local dy = action.screen_y - start.y
+		if math.sqrt(dx * dx + dy * dy) < self.swipe_min then
+			return true
+		end
+
+		if self.state == "gameover" then
+			restart(self)
+		else
+			commit_swipe(self, side_from_swipe(dx, dy))
+		end
+	end
+
+	return true
+end
+
+function on_message(self, message_id, message, sender)
+	if message_id == hash("window_resized") then
+		relayout(self)
+		build_board_node(self)
+		build_hud(self)
+		build_frame(self)
+		refresh(self)
+	elseif message_id == hash("restart") then
+		restart(self)
+	end
+end

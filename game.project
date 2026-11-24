@@ -1,0 +1,31 @@
+[bootstrap]
+main_collection = /main/main.collectionc
+
+[script]
+shared_state = 1
+
+[display]
+width = 420
+height = 800
+high_dpi = 1
+dynamic_orientation = 0
+
+[render]
+clear_color_red = 0.043
+clear_color_green = 0.059
+clear_color_blue = 0.086
+clear_color_alpha = 1.0
+
+[gui]
+max_count = 2048
+
+[html5]
+scale_mode = fit
+show_fullscreen_button = 1
+
+[android]
+input_method = HiddenInputField
+
+[project]
+title = kvadrok
+version = 1.0

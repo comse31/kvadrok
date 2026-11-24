@@ -1,0 +1,12 @@
+font: "/assets/DejaVuSans.ttf"
+material: "/builtins/fonts/font-df.material"
+size: 22
+antialias: 1
+alpha: 1.0
+outline_alpha: 0.0
+shadow_alpha: 0.0
+shadow_blur: 0
+cache_width: 2048
+cache_height: 1024
+extra_characters: "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюяЁё«»—–…№·"
+output_format: TYPE_DISTANCE_FIELD

@@ -1,0 +1,17 @@
+script: "/main/game.gui_script"
+adjust_reference: ADJUST_REFERENCE_PARENT
+material: "/builtins/materials/gui.material"
+fonts {
+  name: "main"
+  font: "/assets/main.font"
+}
+textures {
+  name: "main"
+  texture: "/assets/main.atlas"
+}
+background_color {
+  x: 0.043
+  y: 0.059
+  z: 0.086
+  w: 1.0
+}
