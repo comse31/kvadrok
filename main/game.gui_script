@@ -42,6 +42,17 @@ local FRAME_GLOWS = {
 -- Длительность анимации возврата детали в центр (секунды).
 local RETURN_DURATION = 0.22
 
+-- Анимация уборки кубиков: каждый кубик летит в центр поля и растворяется.
+-- Кубики запускаются каскадом (слева направо для ряда, сверху вниз для
+-- столбца), поэтому задержка между ними ограничена сверху и по сумме.
+local CLEAR_CUBE_DURATION = 0.3
+local CLEAR_STAGGER_MAX = 0.06
+local CLEAR_STAGGER_TOTAL = 0.9
+
+-- Анимация сдвига оставшихся кубиков к ближайшей стороне поля. Начинается
+-- после исчезновения убранных кубиков.
+local MOVE_CUBE_DURATION = 0.2
+
 -- Высота подсветки верхней грани клетки детали (доля клетки).
 local PIECE_HI_R = 0.18
 
@@ -73,6 +84,8 @@ local HINT_PLAY = "Тащи деталь к краю или к фигуре"
 local HINT_DRAG_OK = "Отпусти — деталь останется"
 local HINT_DRAG_BAD = "Нет опоры — вернётся в центр"
 local HINT_GAMEOVER = "Тап — новая игра"
+local HINT_WIN = "Победа! Тап — новая игра"
+local HINT_CLEAR = "Ряд собран — кубики убраны"
 
 local function rgb_str(rgb)
 	return string.char(rgb[1], rgb[2], rgb[3])
@@ -165,7 +178,10 @@ end
 --- ряды перебираются в обратном порядке: иначе поле отрисовывается зеркально.
 local function build_buffer(self)
 	local rows = {}
-	local board = self.board
+	-- Во время анимации сдвига поле рисуется в промежуточном состоянии:
+	-- линии уже убраны, но оставшиеся кубики ещё не сдвинуты. Их сдвиг
+	-- показывают отдельные узлы.
+	local board = self.board_render or self.board
 
 	local empty_block = BLOCKS.empty
 	local zone_block = BLOCKS.zone
@@ -454,6 +470,154 @@ local function color_piece_nodes(self, supported)
 	end
 end
 
+--- Удаляет узлы летящих в центр кубиков.
+local function clear_fly_nodes(self)
+	if self.clear_anim then
+		for i = 1, #self.clear_anim.cubes do
+			local c = self.clear_anim.cubes[i]
+			gui.delete_node(c.fill)
+			gui.delete_node(c.hi)
+		end
+		self.clear_anim = nil
+	end
+end
+
+--- Запускает каскадную уборку кубиков: каждый кубик по очереди (слева
+--- направо для ряда, сверху вниз для столбца) улетает в центр поля и
+--- растворяется там. После неё запускается сдвиг оставшихся кубиков.
+local function start_clear_anim(self, cells, moves)
+	clear_fly_nodes(self)
+
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+
+	local max_order = 0
+	for i = 1, #cells do
+		if cells[i].order > max_order then max_order = cells[i].order end
+	end
+
+	-- Задержка каскада: не больше CLEAR_STAGGER_MAX на кубик и не больше
+	-- CLEAR_STAGGER_TOTAL на всю линию, чтобы анимация не затягивалась.
+	local stagger = 0
+	if max_order > 0 then
+		stagger = math.min(CLEAR_STAGGER_MAX, CLEAR_STAGGER_TOTAL / max_order)
+	end
+
+	local to_x = self.origin_x + self.board_size * 0.5
+	local to_y = self.origin_y + self.board_size * 0.5
+
+	local cubes = {}
+	local last = 0
+	for i = 1, #cells do
+		local c = cells[i]
+		-- Кубик летит из центра своей клетки; узлы получают PIVOT_CENTER,
+		-- чтобы уменьшение происходило вокруг центра.
+		local base_x = self.origin_x + (c.x + 0.5) * cell
+		local base_y = self.origin_y + (c.y + 0.5) * cell
+		local fill_color = PIECE_FILL[c.color] or PIECE_FILL[1]
+		local hi_color = PIECE_HI[c.color] or PIECE_HI[1]
+
+		local fill = make_box(
+			vmath.vector3(base_x, base_y, 0.6),
+			vmath.vector3(cell, cell, 0),
+			vmath.vector4(fill_color.x, fill_color.y, fill_color.z, 1)
+		)
+		local hi = make_box(
+			vmath.vector3(base_x, base_y + (cell - hi_h) * 0.5, 0.62),
+			vmath.vector3(cell, hi_h, 0),
+			vmath.vector4(hi_color.x, hi_color.y, hi_color.z, 1)
+		)
+		gui.set_pivot(fill, gui.PIVOT_CENTER)
+		gui.set_pivot(hi, gui.PIVOT_CENTER)
+
+		local delay = c.order * stagger
+		if delay > last then last = delay end
+
+		cubes[i] = {
+			fill = fill,
+			hi = hi,
+			fill_color = fill_color,
+			hi_color = hi_color,
+			from_x = base_x,
+			from_y = base_y,
+			to_x = to_x,
+			to_y = to_y,
+			delay = delay,
+		}
+	end
+
+	self.clear_anim = {
+		t = 0,
+		cubes = cubes,
+		count = #cells,
+		moves = moves,
+		duration = last + CLEAR_CUBE_DURATION,
+	}
+end
+
+--- Удаляет узлы сдвигающихся кубиков.
+local function clear_move_nodes(self)
+	if self.move_anim then
+		for i = 1, #self.move_anim.cubes do
+			local c = self.move_anim.cubes[i]
+			gui.delete_node(c.fill)
+			gui.delete_node(c.hi)
+		end
+		self.move_anim = nil
+	end
+end
+
+--- Запускает анимацию сдвига оставшихся кубиков к ближайшей стороне поля.
+local function start_move_anim(self, moves)
+	clear_move_nodes(self)
+
+	-- Кубики, которые сейчас сдвигаются, убираем из промежуточного поля:
+	-- дальше их рисуют отдельные узлы, иначе было бы двойное изображение.
+	if self.board_render then
+		for i = 1, #moves do
+			local m = moves[i]
+			self.board_render[m.from_y][m.from_x] = 0
+		end
+		upload_board(self)
+	end
+
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+
+	local cubes = {}
+	for i = 1, #moves do
+		local m = moves[i]
+		local from_x = self.origin_x + m.from_x * cell
+		local from_y = self.origin_y + m.from_y * cell
+		local to_x = self.origin_x + m.to_x * cell
+		local to_y = self.origin_y + m.to_y * cell
+		local fill_color = PIECE_FILL[m.color] or PIECE_FILL[1]
+		local hi_color = PIECE_HI[m.color] or PIECE_HI[1]
+
+		local fill = make_box(
+			vmath.vector3(from_x, from_y, 0.35),
+			vmath.vector3(cell, cell, 0),
+			fill_color
+		)
+		local hi = make_box(
+			vmath.vector3(from_x, from_y + cell - hi_h, 0.37),
+			vmath.vector3(cell, hi_h, 0),
+			hi_color
+		)
+
+		cubes[i] = {
+			fill = fill,
+			hi = hi,
+			from_x = from_x,
+			from_y = from_y,
+			to_x = to_x,
+			to_y = to_y,
+		}
+	end
+
+	self.move_anim = { t = 0, cubes = cubes }
+end
+
 --- Пересоздаёт узлы детали под её текущую форму.
 local function build_piece_nodes(self)
 	clear_piece_nodes(self)
@@ -512,6 +676,36 @@ local function touch_xy(self, action)
 	return raw_touch_xy(action)
 end
 
+--- Согласование слова «кубик» с числом.
+local function cubes_word(n)
+	local m10 = n % 10
+	local m100 = n % 100
+	if m10 == 1 and m100 ~= 11 then
+		return "кубик"
+	end
+	if m10 >= 2 and m10 <= 4 and (m100 < 12 or m100 > 14) then
+		return "кубика"
+	end
+	return "кубиков"
+end
+
+--- Счётчики кубиков: сколько осталось разобрать и сколько уже разобрано.
+local function update_hud(self)
+	local removed = self.removed_cubes or 0
+	if removed == self.shown_removed then
+		return
+	end
+	self.shown_removed = removed
+
+	local left = game.TOTAL_CELLS - removed
+	if left < 0 then
+		left = 0
+	end
+
+	gui.set_text(self.title, "Осталось разобрать " .. tostring(left) .. " " .. cubes_word(left))
+	gui.set_text(self.status, "Разобрано " .. tostring(removed) .. " " .. cubes_word(removed))
+end
+
 --- HUD: координаты заданы в эталонных единицах сцены (BASE_W x BASE_H),
 --- поэтому их пропорции не зависят от фактического размера окна.
 local function build_hud(self)
@@ -520,29 +714,42 @@ local function build_hud(self)
 
 	if self.title then
 		gui.delete_node(self.title)
-		gui.delete_node(self.score)
 		gui.delete_node(self.hint)
 		gui.delete_node(self.status)
 	end
+	if self.score then
+		gui.delete_node(self.score)
+		self.score = nil
+	end
+	if self.heading then
+		gui.delete_node(self.heading)
+		self.heading = nil
+	end
 
-	self.title = make_label(vmath.vector3(w / 2, h - h * 0.065, 0.1), "КВАДРОК", gui.PIVOT_N, COLOR_TEXT)
-	self.score = make_label(vmath.vector3(w / 2, h - h * 0.11, 0.1), "", gui.PIVOT_N, COLOR_TEXT_DIM)
+	-- Сверху — заголовок и счётчик оставшихся кубиков,
+	-- снизу — счётчик уже разобранных.
+	self.heading = make_label(vmath.vector3(w / 2, h - h * 0.05, 0.1), "КВАДРОК", gui.PIVOT_N, COLOR_TEXT)
+	self.title = make_label(vmath.vector3(w / 2, h - h * 0.105, 0.1), "", gui.PIVOT_N, COLOR_TEXT)
 	self.status = make_label(vmath.vector3(w / 2, h * 0.095, 0.1), "", gui.PIVOT_S, COLOR_TEXT_DIM)
 	-- Сохраняем актуальную подсказку при пересоздании узла (например, после resize).
 	self.hint = make_label(
-		vmath.vector3(w / 2, h * 0.055, 0.1),
+		vmath.vector3(w / 2, h * 0.05, 0.1),
 		self.hint_text or HINT_PLAY,
 		gui.PIVOT_S,
-		COLOR_TEXT
+		COLOR_TEXT_DIM
 	)
 
 	-- Размер шрифта пропорционален стороне поля (22 px при поле ~420 px).
 	local font_scale = math.max(0.6, self.board_size / 420)
 
-	local labels = { self.title, self.score, self.status, self.hint }
+	local labels = { self.heading, self.title, self.status, self.hint }
 	for i = 1, #labels do
 		gui.set_scale(labels[i], vmath.vector3(font_scale, font_scale, 1))
 	end
+
+	-- Узлы пересозданы пустыми — заставляем счётчики перерисоваться.
+	self.shown_removed = nil
+	update_hud(self)
 end
 
 local function set_hint(self, text)
@@ -551,23 +758,6 @@ local function set_hint(self, text)
 	end
 	self.hint_text = text
 	gui.set_text(self.hint, text)
-end
-
-local function update_hud(self)
-	if self.points ~= self.shown_points then
-		self.shown_points = self.points
-		gui.set_text(self.score, "Очки: " .. tostring(self.points))
-	end
-
-	if self.state == "gameover" then
-		return
-	end
-
-	local pct = math.floor((self.danger or 0) * 100 + 0.5)
-	if pct ~= self.shown_pct then
-		self.shown_pct = pct
-		gui.set_text(self.status, "Угроза: " .. tostring(pct) .. "%")
-	end
 end
 
 local function refresh(self)
@@ -593,17 +783,19 @@ local function drop_supported(self)
 		and game.has_support(self.board, piece.cells, piece.x, piece.y)
 end
 
---- Завершает партию: фиксируем причину и показываем подсказку рестарта.
-local function game_over(self, reason)
+--- Завершает партию: показываем подсказку рестарта.
+--- is_loss подсвечивает контур красным (зона появления заблокирована).
+local function game_over(self, hint_text, is_loss)
 	self.state = "gameover"
 	self.piece = nil
 	self.drag = nil
 	self.return_anim = nil
 	clear_piece_nodes(self)
-	self.danger_target = 1
-	self.danger = 1
-	set_hint(self, HINT_GAMEOVER)
-	gui.set_text(self.status, reason)
+	if is_loss then
+		self.danger_target = 1
+		self.danger = 1
+	end
+	set_hint(self, hint_text or HINT_GAMEOVER)
 	refresh(self)
 end
 
@@ -613,13 +805,13 @@ local function spawn(self)
 	local x, y = game.spawn_pos(piece)
 
 	if not game.can_place(self.board, piece.cells, x, y) then
-		game_over(self, "Зона занята")
+		game_over(self, HINT_GAMEOVER, true)
 		return
 	end
 
 	-- Если деталь некуда поставить с опорой, партия исчерпана.
 	if not game.has_any_drop(self.board, piece) then
-		game_over(self, "Нет места для детали")
+		game_over(self, HINT_GAMEOVER, true)
 		return
 	end
 
@@ -646,9 +838,27 @@ local function release_piece(self)
 
 	if drop_supported(self) then
 		game.place(self.board, piece.cells, piece.x, piece.y, piece.color)
-		self.points = self.points + #piece.cells
+
+		-- Полностью заполненные ряды и столбцы убираются с поля.
+		local cleared, rows, cols = game.clear_lines(self.board)
+
 		self.piece = nil
 		clear_piece_nodes(self)
+
+		if #cleared > 0 then
+			-- Пока идёт анимация, поле рисуется сразу после удаления линий,
+			-- но ещё без сдвига: сдвигающиеся кубики пока стоят на месте.
+			self.board_render = game.clone_board(self.board)
+			local moves = game.collapse(self.board, rows, cols)
+			refresh(self)
+
+			-- Кубики каскадом улетают в центр поля; сдвиг оставшихся,
+			-- счётчик и следующая деталь начнутся после завершения анимации.
+			set_hint(self, HINT_CLEAR)
+			start_clear_anim(self, cleared, moves)
+			return
+		end
+
 		refresh(self)
 		spawn(self)
 		return
@@ -687,17 +897,18 @@ end
 
 local function restart(self)
 	self.board = game.new_board()
-	self.points = 0
+	self.board_render = nil
+	self.removed_cubes = 0
 	self.danger = 0
 	self.danger_target = 0
-	self.shown_pct = nil
-	self.shown_points = nil
+	self.shown_removed = nil
 	self.state = "play"
 	self.drag = nil
 	self.return_anim = nil
 	self.piece = nil
 	clear_piece_nodes(self)
-	gui.set_text(self.status, "")
+	clear_fly_nodes(self)
+	clear_move_nodes(self)
 	-- Сразу возвращаем контуру зелёный цвет (он мог остаться красным).
 	update_frame(self)
 	update_hud(self)
@@ -705,13 +916,13 @@ local function restart(self)
 end
 
 function init(self)
-	self.points = 0
+	self.removed_cubes = 0
 	self.state = "play"
 	self.board = game.new_board()
+	self.board_render = nil
 	self.danger = 0
 	self.danger_target = 0
-	self.shown_pct = nil
-	self.shown_points = nil
+	self.shown_removed = nil
 	self.drag = nil
 	self.return_anim = nil
 
@@ -726,7 +937,123 @@ function init(self)
 	msg.post(".", "acquire_input_focus")
 end
 
+--- Каскадное исчезновение кубиков в центре поля.
+local function update_clear_anim(self, dt)
+	local anim = self.clear_anim
+	if not anim then
+		return
+	end
+
+	anim.t = anim.t + dt
+
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+
+	for i = 1, #anim.cubes do
+		local c = anim.cubes[i]
+		local k = (anim.t - c.delay) / CLEAR_CUBE_DURATION
+		if k < 0 then
+			k = 0
+		elseif k > 1 then
+			k = 1
+		end
+
+		-- Кубик улетает к центру поля, уменьшаясь и растворяясь.
+		local e = k * k
+		local x = lerp(c.from_x, c.to_x, e)
+		local y = lerp(c.from_y, c.to_y, e)
+
+		local shrink = 1 - k
+		local size = cell * (0.25 + 0.75 * shrink)
+		local alpha = 1 - k * k * k
+
+		gui.set_position(c.fill, vmath.vector3(x, y, 0.6))
+		gui.set_size(c.fill, vmath.vector3(size, size, 0))
+		gui.set_color(c.fill, vmath.vector4(
+			c.fill_color.x, c.fill_color.y, c.fill_color.z, alpha
+		))
+
+		local hi_size = hi_h * (0.25 + 0.75 * shrink)
+		gui.set_position(c.hi, vmath.vector3(x, y + size * 0.5 - hi_size * 0.5, 0.62))
+		gui.set_size(c.hi, vmath.vector3(size, hi_size, 0))
+		gui.set_color(c.hi, vmath.vector4(
+			c.hi_color.x, c.hi_color.y, c.hi_color.z, alpha
+		))
+	end
+
+	if anim.t >= anim.duration then
+		local count = anim.count
+		local moves = anim.moves
+		clear_fly_nodes(self)
+
+		self.removed_cubes = (self.removed_cubes or 0) + count
+		update_hud(self)
+
+		-- Сдвиг оставшихся кубиков: показывает узлы, поле уже содержит
+		-- конечное состояние, а буфер рисуется из промежуточного.
+		if moves and #moves > 0 then
+			start_move_anim(self, moves)
+		else
+			self.board_render = nil
+			upload_board(self)
+		end
+
+		if self.removed_cubes >= game.TOTAL_CELLS then
+			game_over(self, HINT_WIN, false)
+			return
+		end
+
+		if not self.move_anim then
+			set_hint(self, HINT_PLAY)
+			spawn(self)
+		end
+	end
+end
+
+--- Анимация сдвига оставшихся кубиков к ближайшей стороне поля.
+local function update_move_anim(self, dt)
+	local anim = self.move_anim
+	if not anim then
+		return
+	end
+
+	anim.t = anim.t + dt
+	local k = anim.t / MOVE_CUBE_DURATION
+	if k > 1 then k = 1 end
+	local e = 1 - (1 - k) * (1 - k)
+
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+
+	for i = 1, #anim.cubes do
+		local c = anim.cubes[i]
+		local x = lerp(c.from_x, c.to_x, e)
+		local y = lerp(c.from_y, c.to_y, e)
+		gui.set_position(c.fill, vmath.vector3(x, y, 0.35))
+		gui.set_position(c.hi, vmath.vector3(x, y + cell - hi_h, 0.37))
+	end
+
+	if k >= 1 then
+		clear_move_nodes(self)
+		self.board_render = nil
+		upload_board(self)
+
+		if self.state ~= "gameover" then
+			set_hint(self, HINT_PLAY)
+			spawn(self)
+		end
+	end
+end
+
 function update(self, dt)
+	-- Анимации уборки и сдвига кубиков блокируют ввод до своего завершения.
+	if self.clear_anim then
+		update_clear_anim(self, dt)
+	end
+	if self.move_anim then
+		update_move_anim(self, dt)
+	end
+
 	-- Анимация возврата детали в центр зоны.
 	local anim = self.return_anim
 	if anim then
@@ -813,7 +1140,15 @@ function on_input(self, action_id, action)
 		return false
 	end
 
-	-- Пока деталь летит в центр, ввод игнорируем.
+	-- Пока кубики убираются/сдвигаются или деталь летит в центр, ввод
+	-- игнорируем (кроме тапа после победы — его обрабатывает gameover).
+	if self.clear_anim or self.move_anim then
+		if self.state == "gameover" and action.pressed then
+			restart(self)
+		end
+		return true
+	end
+
 	if self.return_anim then
 		return true
 	end
@@ -910,6 +1245,28 @@ end
 
 function on_message(self, message_id, message, sender)
 	if message_id == hash("window_resized") then
+		-- Ресайз во время анимаций: завершаем их досрочно, иначе пиксельные
+		-- координаты кубиков разъедутся с новой сеткой поля.
+		if self.move_anim then
+			clear_move_nodes(self)
+			self.board_render = nil
+		end
+
+		if self.clear_anim then
+			local count = self.clear_anim.count
+			clear_fly_nodes(self)
+			self.board_render = nil
+			self.removed_cubes = (self.removed_cubes or 0) + count
+			update_hud(self)
+		end
+
+		if not self.piece and self.state ~= "gameover" then
+			spawn(self)
+			if self.state == "gameover" then
+				return
+			end
+		end
+
 		-- Ресайз во время возврата: сразу доводим деталь до центра,
 		-- чтобы пиксельные координаты анимации не разъехались с новой сеткой.
 		if self.return_anim and self.piece then

@@ -1,6 +1,6 @@
 --- Игровая логика «Квадрок» (чистый Lua, без зависимостей от движка).
----
---- Поле 30x30. В центре поля находится квадрат 5x5, выделенный контуром:
+--- Поле по умолчанию 20x20 (размер задаётся настройкой M.FIELD_SIZE).
+--- В центре поля находится квадрат 5x5, выделенный контуром:
 --- именно в нём появляются новые фигуры-тетромино.
 ---
 --- Игрок тапом захватывает фигуру и тащит её в любом направлении. Пока фигура
@@ -16,8 +16,14 @@
 
 local M = {}
 
-M.W = 30
-M.H = 30
+--- Настройка: сторона игрового поля в клетках (по умолчанию 20x20).
+M.FIELD_SIZE = 20
+
+M.W = M.FIELD_SIZE
+M.H = M.FIELD_SIZE
+
+--- Сколько кубиков нужно разобрать за партию: S * S * 2 / 4, где S = FIELD_SIZE.
+M.TOTAL_CELLS = math.floor(M.FIELD_SIZE * M.FIELD_SIZE * 2 / 4)
 
 --- Сторона центрального квадрата появления фигур (в клетках).
 M.ZONE = 5
@@ -290,6 +296,216 @@ function M.place(board, cells, px, py, color)
 		placed[#placed + 1] = { x, y }
 	end
 	return placed
+end
+
+--- Убирает кубики из полностью заполненных рядов и столбцов.
+--- Ряд или столбец считается заполненным, только если в нём нет пробелов.
+---
+--- Возвращает:
+---   cells — массив убранных клеток { x, y, color, order }, где order —
+---           позиция клетки внутри линии (для каскадной анимации удаления):
+---           для ряда — слева направо, для столбца — сверху вниз;
+---   rows  — таблица «удалённый ряд» (ключ — индекс ряда);
+---   cols  — таблица «удалённый столбец» (ключ — индекс столбца).
+function M.clear_lines(board)
+	local rows = {}
+	local cols = {}
+	local has_full = false
+
+	for y = 0, M.H - 1 do
+		local row = board[y]
+		local full = true
+		for x = 0, M.W - 1 do
+			if row[x] == 0 then
+				full = false
+				break
+			end
+		end
+		if full then
+			rows[y] = true
+			has_full = true
+		end
+	end
+
+	for x = 0, M.W - 1 do
+		local full = true
+		for y = 0, M.H - 1 do
+			if board[y][x] == 0 then
+				full = false
+				break
+			end
+		end
+		if full then
+			cols[x] = true
+			has_full = true
+		end
+	end
+
+	if not has_full then
+		return {}, nil, nil
+	end
+
+	local cells = {}
+	for y = 0, M.H - 1 do
+		local row = board[y]
+		for x = 0, M.W - 1 do
+			if (rows[y] or cols[x]) and row[x] ~= 0 then
+				-- Ряд идёт слева направо, столбец — сверху вниз (ряд 0 — нижний).
+				local in_row = rows[y]
+				local col_order = M.H - 1 - y
+				local order
+				if in_row and cols[x] then
+					order = math.min(x, col_order)
+				elseif in_row then
+					order = x
+				else
+					order = col_order
+				end
+
+				cells[#cells + 1] = { x = x, y = y, color = row[x], order = order }
+				row[x] = 0
+			end
+		end
+	end
+
+	return cells, rows, cols
+end
+
+--- Вычисляет сдвиги кубиков, примыкающих к удалённым линиям, к ближайшей
+--- стороне поля. Сдвигается только связная группа, непосредственно примыкающая
+--- к удалённой линии: кубики за пробелом остаются на месте.
+--- Поле не изменяется — только возвращается список перемещений.
+---
+--- Возвращает массив перемещений { from_x, from_y, to_x, to_y, color }.
+function M.collapse(board, rows, cols)
+	local moves = {}
+
+	--- Присоединяет перемещение к уже начатому, если кубик сдвигается повторно.
+	local function add_move(from_x, from_y, to_x, to_y, color)
+		for i = 1, #moves do
+			local m = moves[i]
+			if m.to_x == from_x and m.to_y == from_y then
+				m.to_x = to_x
+				m.to_y = to_y
+				return
+			end
+		end
+		moves[#moves + 1] = {
+			from_x = from_x,
+			from_y = from_y,
+			to_x = to_x,
+			to_y = to_y,
+			color = color,
+		}
+	end
+
+	-- Вертикальные сдвиги по удалённым рядам.
+	if rows then
+		local y = 0
+		while y < M.H do
+			if rows[y] then
+				local lo = y
+				while y + 1 < M.H and rows[y + 1] do
+					y = y + 1
+				end
+				local hi = y
+				local count = hi - lo + 1
+				-- Направление — к ближайшей горизонтальной стороне поля.
+				-- Если пустота ближе к верху, кубики под ней поднимаются вверх,
+				-- и наоборот: если ближе к низу — кубики над ней опускаются.
+				local up = (lo + hi) * 0.5 >= (M.H - 1) * 0.5
+
+				for x = 0, M.W - 1 do
+					if up then
+						-- Связная цепочка кубиков непосредственно под пустотой.
+						-- Идём от ближайшего к пустоте кубика вниз, чтобы не
+						-- затирать ещё не перенесённые клетки.
+						local cy = lo - 1
+						while cy >= 0 and board[cy][x] ~= 0 do
+							local to_y = cy + count
+							local color = board[cy][x]
+							board[to_y][x] = color
+							board[cy][x] = 0
+							add_move(x, cy, x, to_y, color)
+							cy = cy - 1
+						end
+					else
+						-- Связная цепочка кубиков непосредственно над пустотой.
+						local cy = hi + 1
+						while cy < M.H and board[cy][x] ~= 0 do
+							local to_y = cy - count
+							local color = board[cy][x]
+							board[to_y][x] = color
+							board[cy][x] = 0
+							add_move(x, cy, x, to_y, color)
+							cy = cy + 1
+						end
+					end
+				end
+			end
+			y = y + 1
+		end
+	end
+
+	-- Горизонтальные сдвиги по удалённым столбцам.
+	if cols then
+		local x = 0
+		while x < M.W do
+			if cols[x] then
+				local lo = x
+				while x + 1 < M.W and cols[x + 1] do
+					x = x + 1
+				end
+				local hi = x
+				local count = hi - lo + 1
+				-- Направление — к ближайшей вертикальной стороне поля.
+				local left = (lo + hi) * 0.5 <= (M.W - 1) * 0.5
+
+				for y = 0, M.H - 1 do
+					if left then
+						-- Цепочка кубиков справа от пустоты сдвигается влево.
+						local cx = hi + 1
+						while cx < M.W and board[y][cx] ~= 0 do
+							local to_x = cx - count
+							local color = board[y][cx]
+							board[y][to_x] = color
+							board[y][cx] = 0
+							add_move(cx, y, to_x, y, color)
+							cx = cx + 1
+						end
+					else
+						-- Цепочка кубиков слева от пустоты сдвигается вправо.
+						local cx = lo - 1
+						while cx >= 0 and board[y][cx] ~= 0 do
+							local to_x = cx + count
+							local color = board[y][cx]
+							board[y][to_x] = color
+							board[y][cx] = 0
+							add_move(cx, y, to_x, y, color)
+							cx = cx - 1
+						end
+					end
+				end
+			end
+			x = x + 1
+		end
+	end
+
+	return moves
+end
+
+--- Полная копия поля.
+function M.clone_board(board)
+	local copy = {}
+	for y = 0, M.H - 1 do
+		local row = {}
+		local src = board[y]
+		for x = 0, M.W - 1 do
+			row[x] = src[x]
+		end
+		copy[y] = row
+	end
+	return copy
 end
 
 --- Количество занятых клеток (для статистики).
