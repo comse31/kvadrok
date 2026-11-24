@@ -708,6 +708,28 @@ local function board_point(self, x, y)
 	return (x - self.origin_x) / self.cell, (y - self.origin_y) / self.cell
 end
 
+--- Идентификатор касания: в новых версиях Defold он есть и в action.id,
+--- и в записи action.touch; поддерживаем оба варианта.
+local function touch_id(action)
+	if action.id ~= nil then
+		return action.id
+	end
+	local entry = action.touch and action.touch[1]
+	return entry and entry.id or nil
+end
+
+--- Координаты указателя: сначала плоские поля action, затем запись touch.
+local function touch_xy(action)
+	if action.x ~= nil and action.y ~= nil then
+		return action.x, action.y
+	end
+	local entry = action.touch and action.touch[1]
+	if entry and entry.x ~= nil and entry.y ~= nil then
+		return entry.x, entry.y
+	end
+	return nil, nil
+end
+
 --- Есть ли клетка (cx, cy) в составе детали.
 local function piece_has_cell(piece, cx, cy)
 	for i = 1, #piece.cells do
@@ -738,7 +760,12 @@ function on_input(self, action_id, action)
 			return true
 		end
 
-		local bx, by = board_point(self, action.x, action.y)
+		local ax, ay = touch_xy(action)
+		if ax == nil then
+			return true
+		end
+
+		local bx, by = board_point(self, ax, ay)
 		local cx = math.floor(bx)
 		local cy = math.floor(by)
 		if not piece_has_cell(piece, cx, cy) then
@@ -748,7 +775,7 @@ function on_input(self, action_id, action)
 		-- Захват: запоминаем дробное смещение точки внутри детали, чтобы она
 		-- не «прыгала» при первом же сдвиге.
 		self.drag = {
-			id = action.id,
+			id = touch_id(action),
 			off_x = bx - piece.x,
 			off_y = by - piece.y,
 		}
@@ -761,19 +788,35 @@ function on_input(self, action_id, action)
 		return true
 	end
 
-	if action.id ~= self.drag.id then
+	if self.drag.id ~= nil and touch_id(action) ~= self.drag.id then
 		return true
 	end
 
-	if action.moved or action.released then
-		local bx, by = board_point(self, action.x, action.y)
+	-- Defold присылает экшен каждый кадр, пока палец на экране: отдельного
+	-- признака `moved` у touch-экшена нет, поэтому двигаем деталь по
+	-- актуальным координатам указателя.
+	local ax, ay = touch_xy(action)
+	if ax ~= nil then
+		local bx, by = board_point(self, ax, ay)
 		-- Квантизация: деталь двигается по клеткам, оставаясь под пальцем.
-		local px = math.floor(bx - self.drag.off_x + 0.5)
-		local py = math.floor(by - self.drag.off_y + 0.5)
+		local want_x = math.floor(bx - self.drag.off_x + 0.5)
+		local want_y = math.floor(by - self.drag.off_y + 0.5)
 		local piece = self.piece
 		if piece then
-			px, py = game.clamp_pos(piece, px, py)
-			if game.can_place(self.board, piece.cells, px, py) then
+			want_x, want_y = game.clamp_pos(piece, want_x, want_y)
+
+			-- Скольжение вдоль препятствий: если целевая клетка занята, деталь
+			-- продолжает двигаться по свободной оси, а не застревает.
+			local px, py = piece.x, piece.y
+			if game.can_place(self.board, piece.cells, want_x, want_y) then
+				px, py = want_x, want_y
+			elseif game.can_place(self.board, piece.cells, want_x, py) then
+				px = want_x
+			elseif game.can_place(self.board, piece.cells, px, want_y) then
+				py = want_y
+			end
+
+			if px ~= piece.x or py ~= piece.y then
 				piece.x = px
 				piece.y = py
 				snap_piece_nodes(self)
@@ -794,6 +837,18 @@ end
 
 function on_message(self, message_id, message, sender)
 	if message_id == hash("window_resized") then
+		-- Ресайз во время возврата: сразу доводим деталь до центра,
+		-- чтобы пиксельные координаты анимации не разъехались с новой сеткой.
+		if self.return_anim and self.piece then
+			local piece = self.piece
+			piece.x = self.return_anim.sx
+			piece.y = self.return_anim.sy
+			self.return_anim = nil
+			self.drag = nil
+			if self.state ~= "gameover" then
+				set_hint(self, HINT_PLAY)
+			end
+		end
 		relayout(self)
 		build_board_node(self)
 		build_hud(self)
