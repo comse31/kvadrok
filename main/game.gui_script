@@ -12,9 +12,6 @@ local MARGIN_TOP_R = 0.165   -- 132 px при высоте 800
 local MARGIN_BOTTOM_R = 0.145 -- 116 px при высоте 800
 local MARGIN_SIDE_R = 0.048  -- 20 px при ширине 420
 
--- Минимальная длина свайпа — в долях от стороны игрового поля.
-local SWIPE_MIN_R = 0.055
-
 -- Разрешение одной клетки в текстуре поля.
 local CELL_PX = 8
 
@@ -26,6 +23,12 @@ local TEX_H = M * CELL_PX
 local FRAME_T_R = 0.26
 local FRAME_GLOW_T_R = 1.05
 local FRAME_GLOW_ALPHA = 0.16
+
+-- Длительность анимации возврата детали в центр (секунды).
+local RETURN_DURATION = 0.22
+
+-- Высота подсветки верхней грани клетки детали (доля клетки).
+local PIECE_HI_R = 0.18
 
 -- Палитра клеток (RGB 0..255).
 local CELL_RGB = {
@@ -50,6 +53,11 @@ local COLOR_BAD = { 246, 62, 62 }
 
 local COLOR_TEXT = vmath.vector4(0.92, 0.95, 1.0, 1.0)
 local COLOR_TEXT_DIM = vmath.vector4(0.60, 0.67, 0.80, 1.0)
+
+local HINT_PLAY = "Тащи деталь к краю или к фигуре"
+local HINT_DRAG_OK = "Отпусти — деталь останется"
+local HINT_DRAG_BAD = "Нет опоры — вернётся в центр"
+local HINT_GAMEOVER = "Тап — новая игра"
 
 local function rgb_str(rgb)
 	return string.char(rgb[1], rgb[2], rgb[3])
@@ -105,21 +113,42 @@ local function prepare_blocks()
 	end
 end
 
+-- Готовые цвета для узлов детали: обычный, подсветка и приглушённый (нет опоры).
+local PIECE_FILL = {}
+local PIECE_HI = {}
+local PIECE_FILL_DIM = {}
+local PIECE_HI_DIM = {}
+
+local function prepare_piece_colors()
+	local function vec(r, g, b)
+		return vmath.vector4(r / 255, g / 255, b / 255, 1)
+	end
+	for i = 1, #CELL_RGB do
+		local rgb = CELL_RGB[i]
+		PIECE_FILL[i] = vec(rgb[1], rgb[2], rgb[3])
+		PIECE_HI[i] = vec(
+			math.min(255, rgb[1] * 1.18),
+			math.min(255, rgb[2] * 1.18),
+			math.min(255, rgb[3] * 1.18)
+		)
+		-- Приглушённый вариант: смешиваем с фоном поля.
+		local f = 0.45
+		local dr = rgb[1] * f + RGB_EMPTY[1] * (1 - f)
+		local dg = rgb[2] * f + RGB_EMPTY[2] * (1 - f)
+		local db = rgb[3] * f + RGB_EMPTY[3] * (1 - f)
+		PIECE_FILL_DIM[i] = vec(dr, dg, db)
+		PIECE_HI_DIM[i] = vec(
+			math.min(255, dr * 1.18),
+			math.min(255, dg * 1.18),
+			math.min(255, db * 1.18)
+		)
+	end
+end
+
 --- Собирает буфер текстуры по текущему состоянию поля.
 local function build_buffer(self)
 	local rows = {}
 	local board = self.board
-	local piece = self.piece
-
-	-- Карта клеток текущей фигуры для быстрого поиска.
-	local overlay = {}
-	if piece then
-		for i = 1, #piece.cells do
-			local cx = piece.x + piece.cells[i][1]
-			local cy = piece.y + piece.cells[i][2]
-			overlay[cy * N + cx] = piece.color
-		end
-	end
 
 	local empty_block = BLOCKS.empty
 	local zone_block = BLOCKS.zone
@@ -133,7 +162,7 @@ local function build_buffer(self)
 		end
 
 		for x = 0, N - 1 do
-			local index = overlay[y * N + x] or row[x]
+			local index = row[x]
 			local block
 			if index == 0 then
 				if x >= ZONE_X and x < ZONE_X + ZONE
@@ -227,7 +256,6 @@ local function relayout(self)
 
 	self.margin_top = margin_top
 	self.margin_bottom = margin_bottom
-	self.swipe_min = size * SWIPE_MIN_R
 	-- Толщины линий контура пропорциональны клетке поля.
 	self.frame_t = math.max(1.5, self.cell * FRAME_T_R)
 	self.frame_glow_t = math.max(self.frame_t, self.cell * FRAME_GLOW_T_R)
@@ -324,6 +352,99 @@ local function update_frame(self)
 	end
 end
 
+--- Удаляет узлы текущей детали.
+local function clear_piece_nodes(self)
+	if self.piece_nodes then
+		for i = 1, #self.piece_nodes do
+			local n = self.piece_nodes[i]
+			gui.delete_node(n.fill)
+			gui.delete_node(n.hi)
+		end
+		self.piece_nodes = nil
+	end
+end
+
+--- Ставит узлы детали в пиксельную позицию (левый нижний угол её bbox).
+local function position_piece_nodes(self, base_x, base_y)
+	if not self.piece_nodes then
+		return
+	end
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+	for i = 1, #self.piece_nodes do
+		local n = self.piece_nodes[i]
+		local x = base_x + n.cx * cell
+		local y = base_y + n.cy * cell
+		gui.set_position(n.fill, vmath.vector3(x, y, 0.5))
+		gui.set_position(n.hi, vmath.vector3(x, y + cell - hi_h, 0.52))
+	end
+end
+
+--- Ставит узлы детали в позицию по клеткам.
+local function snap_piece_nodes(self)
+	local piece = self.piece
+	if not piece then
+		return
+	end
+	position_piece_nodes(
+		self,
+		self.origin_x + piece.x * self.cell,
+		self.origin_y + piece.y * self.cell
+	)
+end
+
+--- Перекрашивает деталь: обычный цвет, если отпускание оставит её на поле,
+--- иначе — приглушённый (визуальная подсказка «вернётся в центр»).
+local function color_piece_nodes(self, supported)
+	local piece = self.piece
+	if not piece or not self.piece_nodes then
+		return
+	end
+	local fill_set = supported and PIECE_FILL or PIECE_FILL_DIM
+	local hi_set = supported and PIECE_HI or PIECE_HI_DIM
+	local c = piece.color
+	if not fill_set[c] then
+		c = 1
+	end
+	for i = 1, #self.piece_nodes do
+		gui.set_color(self.piece_nodes[i].fill, fill_set[c])
+		gui.set_color(self.piece_nodes[i].hi, hi_set[c])
+	end
+end
+
+--- Пересоздаёт узлы детали под её текущую форму.
+local function build_piece_nodes(self)
+	clear_piece_nodes(self)
+	local piece = self.piece
+	if not piece then
+		return
+	end
+
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+	local nodes = {}
+	for i = 1, #piece.cells do
+		local fill = make_box(
+			vmath.vector3(0, 0, 0.5),
+			vmath.vector3(cell, cell, 0),
+			PIECE_FILL[piece.color] or PIECE_FILL[1]
+		)
+		local hi = make_box(
+			vmath.vector3(0, 0, 0.52),
+			vmath.vector3(cell, hi_h, 0),
+			PIECE_HI[piece.color] or PIECE_HI[1]
+		)
+		nodes[i] = {
+			fill = fill,
+			hi = hi,
+			cx = piece.cells[i][1],
+			cy = piece.cells[i][2],
+		}
+	end
+	self.piece_nodes = nodes
+	snap_piece_nodes(self)
+end
+
 --- HUD: позиции в долях размера сцены, шрифт масштабируется вместе с полем.
 local function build_hud(self)
 	local w = self.scene_w
@@ -342,12 +463,26 @@ local function build_hud(self)
 	self.title = make_label(vmath.vector3(w / 2, h - h * 0.065, 0.1), "КВАДРОК", gui.PIVOT_N, COLOR_TEXT)
 	self.score = make_label(vmath.vector3(w / 2, h - h * 0.11, 0.1), "", gui.PIVOT_N, COLOR_TEXT_DIM)
 	self.status = make_label(vmath.vector3(w / 2, h * 0.095, 0.1), "", gui.PIVOT_S, COLOR_TEXT_DIM)
-	self.hint = make_label(vmath.vector3(w / 2, h * 0.055, 0.1), "Свайп в сторону", gui.PIVOT_S, COLOR_TEXT)
+	-- Сохраняем актуальную подсказку при пересоздании узла (например, после resize).
+	self.hint = make_label(
+		vmath.vector3(w / 2, h * 0.055, 0.1),
+		self.hint_text or HINT_PLAY,
+		gui.PIVOT_S,
+		COLOR_TEXT
+	)
 
 	local labels = { self.title, self.score, self.status, self.hint }
 	for i = 1, #labels do
 		gui.set_scale(labels[i], vmath.vector3(scale, scale, 1))
 	end
+end
+
+local function set_hint(self, text)
+	if self.hint_text == text then
+		return
+	end
+	self.hint_text = text
+	gui.set_text(self.hint, text)
 end
 
 local function update_hud(self)
@@ -372,7 +507,22 @@ local function refresh(self)
 		self.danger_target = game.danger(self.board)
 	end
 	upload_board(self)
+	-- Перекрашиваем контур сразу, чтобы после рестарта и ресайза цвет
+	-- соответствовал текущему состоянию поля.
+	update_frame(self)
 	update_hud(self)
+end
+
+--- Можно ли оставить деталь в текущей позиции:
+--- все клетки свободны, зона появления не задета и есть опора
+--- (граница поля или ранее поставленная деталь).
+local function drop_supported(self)
+	local piece = self.piece
+	if not piece then
+		return false
+	end
+	return game.can_drop(self.board, piece.cells, piece.x, piece.y)
+		and game.has_support(self.board, piece.cells, piece.x, piece.y)
 end
 
 --- Появление новой фигуры в центре зоны.
@@ -383,9 +533,11 @@ local function spawn(self)
 	if not game.can_place(self.board, piece.cells, x, y) then
 		self.state = "gameover"
 		self.piece = nil
+		self.drag = nil
+		clear_piece_nodes(self)
 		self.danger_target = 1
 		self.danger = 1
-		gui.set_text(self.hint, "Свайп — новая игра")
+		set_hint(self, HINT_GAMEOVER)
 		gui.set_text(self.status, "Зона занята")
 		refresh(self)
 		return
@@ -394,47 +546,63 @@ local function spawn(self)
 	piece.x = x
 	piece.y = y
 	self.piece = piece
+	self.drag = nil
+	self.return_anim = nil
+	build_piece_nodes(self)
+	-- В центре у детали ещё нет опоры, но приглушение включается только
+	-- во время перетаскивания, поэтому подсвечиваем её обычным цветом.
+	color_piece_nodes(self, true)
+	set_hint(self, HINT_PLAY)
 	refresh(self)
 end
 
---- Свайп: фигура едет до упора. Если она всё ещё пересекает контур — конец игры.
-local function commit_swipe(self, side)
+--- Отпускание детали: остаётся на поле только при наличии опоры.
+--- Иначе улетает обратно в центр зоны появления.
+local function release_piece(self)
 	local piece = self.piece
 	if not piece then
 		return
 	end
 
-	local dx, dy = game.side_delta(side)
-	local nx, ny = game.slide(self.board, piece.cells, piece.x, piece.y, dx, dy)
-
-	if game.overlaps_zone(piece.cells, nx, ny) then
-		-- Фигура не смогла выйти из зоны — она пересекает контур.
-		game.place(self.board, piece.cells, nx, ny, piece.color)
+	if drop_supported(self) then
+		game.place(self.board, piece.cells, piece.x, piece.y, piece.color)
+		self.points = self.points + #piece.cells
 		self.piece = nil
-		self.state = "gameover"
-		self.danger_target = 1
-		gui.set_text(self.hint, "Свайп — новая игра")
-		gui.set_text(self.status, "Контур пересечён")
+		clear_piece_nodes(self)
 		refresh(self)
+		spawn(self)
 		return
 	end
 
-	game.place(self.board, piece.cells, nx, ny, piece.color)
-	self.piece = nil
-	spawn(self)
-end
+	-- Возврат в центр: плавно, но целевая позиция — клетки зоны появления.
+	local sx, sy = game.spawn_pos(piece)
+	local from_x = self.origin_x + piece.x * self.cell
+	local from_y = self.origin_y + piece.y * self.cell
+	local to_x = self.origin_x + sx * self.cell
+	local to_y = self.origin_y + sy * self.cell
 
-local function side_from_swipe(dx, dy)
-	if math.abs(dx) > math.abs(dy) then
-		if dx < 0 then
-			return game.SIDE_LEFT
-		end
-		return game.SIDE_RIGHT
+	color_piece_nodes(self, false)
+	set_hint(self, HINT_DRAG_BAD)
+
+	if math.abs(from_x - to_x) < 0.5 and math.abs(from_y - to_y) < 0.5 then
+		piece.x = sx
+		piece.y = sy
+		snap_piece_nodes(self)
+		color_piece_nodes(self, true)
+		set_hint(self, HINT_PLAY)
+		return
 	end
-	if dy < 0 then
-		return game.SIDE_BOTTOM
-	end
-	return game.SIDE_TOP
+
+	self.return_anim = {
+		t = 0,
+		dur = RETURN_DURATION,
+		from_x = from_x,
+		from_y = from_y,
+		to_x = to_x,
+		to_y = to_y,
+		sx = sx,
+		sy = sy,
+	}
 end
 
 local function restart(self)
@@ -445,7 +613,14 @@ local function restart(self)
 	self.shown_pct = nil
 	self.shown_points = nil
 	self.state = "play"
-	gui.set_text(self.hint, "Свайп в сторону")
+	self.drag = nil
+	self.return_anim = nil
+	self.piece = nil
+	clear_piece_nodes(self)
+	gui.set_text(self.status, "")
+	-- Сразу возвращаем контуру зелёный цвет (он мог остаться красным).
+	update_frame(self)
+	update_hud(self)
 	spawn(self)
 end
 
@@ -457,8 +632,11 @@ function init(self)
 	self.danger_target = 0
 	self.shown_pct = nil
 	self.shown_points = nil
+	self.drag = nil
+	self.return_anim = nil
 
 	prepare_blocks()
+	prepare_piece_colors()
 	relayout(self)
 	build_board_node(self)
 	build_hud(self)
@@ -469,6 +647,34 @@ function init(self)
 end
 
 function update(self, dt)
+	-- Анимация возврата детали в центр зоны.
+	local anim = self.return_anim
+	if anim then
+		anim.t = anim.t + dt
+		local k = anim.t / anim.dur
+		if k > 1 then k = 1 end
+		-- Плавное замедление в конце.
+		local e = 1 - (1 - k) * (1 - k) * (1 - k)
+		position_piece_nodes(
+			self,
+			lerp(anim.from_x, anim.to_x, e),
+			lerp(anim.from_y, anim.to_y, e)
+		)
+		if k >= 1 then
+			self.return_anim = nil
+			local piece = self.piece
+			if piece then
+				piece.x = anim.sx
+				piece.y = anim.sy
+				snap_piece_nodes(self)
+				color_piece_nodes(self, true)
+			end
+			if self.state ~= "gameover" then
+				set_hint(self, HINT_PLAY)
+			end
+		end
+	end
+
 	local target = self.danger_target or 0
 
 	-- Плавное приближение к целевому значению.
@@ -485,40 +691,90 @@ function update(self, dt)
 	end
 end
 
+--- Клетка поля под точкой касания (дробные координаты в клетках).
+local function board_point(self, x, y)
+	return (x - self.origin_x) / self.cell, (y - self.origin_y) / self.cell
+end
+
+--- Есть ли клетка (cx, cy) в составе детали.
+local function piece_has_cell(piece, cx, cy)
+	for i = 1, #piece.cells do
+		if piece.x + piece.cells[i][1] == cx and piece.y + piece.cells[i][2] == cy then
+			return true
+		end
+	end
+	return false
+end
+
 function on_input(self, action_id, action)
 	if action_id ~= hash("touch") then
 		return false
 	end
 
-	if action.pressed then
-		self.pointer_id = action.id
-		self.pointer_start = vmath.vector3(action.screen_x, action.screen_y, 0)
+	-- Пока деталь летит в центр, ввод игнорируем.
+	if self.return_anim then
 		return true
 	end
 
-	if action.released then
-		if self.pointer_id ~= nil and action.id ~= self.pointer_id then
-			return true
-		end
-		self.pointer_id = nil
-
-		local start = self.pointer_start
-		self.pointer_start = nil
-		if not start then
-			return true
-		end
-
-		local dx = action.screen_x - start.x
-		local dy = action.screen_y - start.y
-		if math.sqrt(dx * dx + dy * dy) < self.swipe_min then
-			return true
-		end
-
+	if action.pressed then
 		if self.state == "gameover" then
 			restart(self)
-		else
-			commit_swipe(self, side_from_swipe(dx, dy))
+			return true
 		end
+		local piece = self.piece
+		if not piece or self.drag then
+			return true
+		end
+
+		local bx, by = board_point(self, action.x, action.y)
+		local cx = math.floor(bx)
+		local cy = math.floor(by)
+		if not piece_has_cell(piece, cx, cy) then
+			return true
+		end
+
+		-- Захват: запоминаем дробное смещение точки внутри детали, чтобы она
+		-- не «прыгала» при первом же сдвиге.
+		self.drag = {
+			id = action.id,
+			off_x = bx - piece.x,
+			off_y = by - piece.y,
+		}
+		color_piece_nodes(self, drop_supported(self))
+		set_hint(self, drop_supported(self) and HINT_DRAG_OK or HINT_DRAG_BAD)
+		return true
+	end
+
+	if not self.drag then
+		return true
+	end
+
+	if action.id ~= self.drag.id then
+		return true
+	end
+
+	if action.moved or action.released then
+		local bx, by = board_point(self, action.x, action.y)
+		-- Квантизация: деталь двигается по клеткам, оставаясь под пальцем.
+		local px = math.floor(bx - self.drag.off_x + 0.5)
+		local py = math.floor(by - self.drag.off_y + 0.5)
+		local piece = self.piece
+		if piece then
+			px, py = game.clamp_pos(piece, px, py)
+			if game.can_place(self.board, piece.cells, px, py) then
+				piece.x = px
+				piece.y = py
+				snap_piece_nodes(self)
+				local ok = drop_supported(self)
+				color_piece_nodes(self, ok)
+				set_hint(self, ok and HINT_DRAG_OK or HINT_DRAG_BAD)
+			end
+		end
+	end
+
+	if action.released then
+		self.drag = nil
+		release_piece(self)
 	end
 
 	return true
@@ -530,6 +786,7 @@ function on_message(self, message_id, message, sender)
 		build_board_node(self)
 		build_hud(self)
 		build_frame(self)
+		build_piece_nodes(self)
 		refresh(self)
 	elseif message_id == hash("restart") then
 		restart(self)

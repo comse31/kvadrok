@@ -1,12 +1,15 @@
 --- Игровая логика «Квадрок» (чистый Lua, без зависимостей от движка).
 ---
 --- Поле 30x30. В центре поля находится квадрат 5x5, выделенный контуром:
---- именно в нём появляются новые фигуры-тетромино. Игрок свайпом уводит
---- фигуру к одной из сторон, и она фиксируется, заполняя поле вокруг зоны.
+--- именно в нём появляются новые фигуры-тетромино.
 ---
---- Зона появления должна оставаться свободной. Если после свайпа фигура
---- так и не смогла полностью покинуть квадрат (пересекла контур) — партия
---- заканчивается.
+--- Игрок тапом захватывает фигуру и тащит её в любом направлении. Пока фигура
+--- в руке, её положение привязано к клеткам поля (квантизация). Отпущенная
+--- фигура остаётся, только если она опирается на край поля или на ранее
+--- поставленную фигуру; иначе она улетает обратно в центр зоны появления.
+---
+--- Зона появления должна оставаться свободной: ставить фигуру поверх неё
+--- нельзя, а если новая фигура не помещается в центре — партия заканчивается.
 ---
 --- Функция M.danger() показывает, насколько плотно фигуры подступили
 --- к контуру: 0 — вокруг пусто, 1 — фигуры вплотную.
@@ -29,10 +32,8 @@ M.DANGER_RADIUS = 7
 --- Сумма весов близости, при которой контур считается полностью красным.
 M.DANGER_SATURATION = 10
 
-M.SIDE_LEFT = 1
-M.SIDE_RIGHT = 2
-M.SIDE_BOTTOM = 3
-M.SIDE_TOP = 4
+--- Считать ли касание углом (по диагонали) опорой для фигуры.
+M.TOUCH_DIAGONAL = false
 
 local BASE_SHAPES = {
 	{ cells = { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 } }, color = 1 }, -- I
@@ -121,6 +122,7 @@ function M.random_piece()
 	return { cells = cells, w = w, h = h, color = shape.color }
 end
 
+--- Свободны ли все клетки фигуры в данной позиции.
 function M.can_place(board, cells, px, py)
 	for i = 1, #cells do
 		local x = px + cells[i][1]
@@ -151,11 +153,68 @@ function M.overlaps_zone(cells, px, py)
 	return false
 end
 
+--- Можно ли вообще поставить фигуру в эту позицию: клетки свободны и зона
+--- появления не задета (зона должна оставаться свободной для новых фигур).
+function M.can_drop(board, cells, px, py)
+	return M.can_place(board, cells, px, py) and not M.overlaps_zone(cells, px, py)
+end
+
+--- Касается ли клетка границы игрового поля.
+function M.on_border(x, y)
+	return x == 0 or x == M.W - 1 or y == 0 or y == M.H - 1
+end
+
+local SUPPORT_DIRS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+local SUPPORT_DIRS_DIAGONAL = {
+	{ 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+	{ 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 },
+}
+
+--- Есть ли у фигуры опора: касание границы поля или ранее поставленной фигуры.
+--- Без опоры отпущенная фигура не остаётся на поле.
+function M.has_support(board, cells, px, py)
+	local dirs = M.TOUCH_DIAGONAL and SUPPORT_DIRS_DIAGONAL or SUPPORT_DIRS
+	for i = 1, #cells do
+		local x = px + cells[i][1]
+		local y = py + cells[i][2]
+		if M.on_border(x, y) then
+			return true
+		end
+		for d = 1, #dirs do
+			local nx = x + dirs[d][1]
+			local ny = y + dirs[d][2]
+			if nx >= 0 and nx < M.W and ny >= 0 and ny < M.H then
+				if board[ny][nx] ~= 0 then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
 --- Позиция появления: по центру зоны.
 function M.spawn_pos(piece)
 	local x = M.ZONE_X + math.floor((M.ZONE - piece.w) / 2)
 	local y = M.ZONE_Y + math.floor((M.ZONE - piece.h) / 2)
 	return x, y
+end
+
+--- Ограничение позиции фигуры рамками поля.
+function M.clamp_pos(piece, px, py)
+	local max_x = M.W - piece.w
+	local max_y = M.H - piece.h
+	if px < 0 then
+		px = 0
+	elseif px > max_x then
+		px = max_x
+	end
+	if py < 0 then
+		py = 0
+	elseif py > max_y then
+		py = max_y
+	end
+	return px, py
 end
 
 --- Расстояние Чебышёва от клетки до прямоугольника зоны (0 — внутри).
@@ -214,30 +273,6 @@ function M.place(board, cells, px, py, color)
 		placed[#placed + 1] = { x, y }
 	end
 	return placed
-end
-
---- Сдвиг фигуры до упора в заданном направлении.
-function M.slide(board, cells, px, py, dx, dy)
-	local steps = 0
-	local limit = (M.W + M.H) * 4
-	while steps < limit and M.can_place(board, cells, px + dx, py + dy) do
-		px = px + dx
-		py = py + dy
-		steps = steps + 1
-	end
-	return px, py, steps
-end
-
---- Направление сдвига для стороны поля.
-function M.side_delta(side)
-	if side == M.SIDE_LEFT then
-		return -1, 0
-	elseif side == M.SIDE_RIGHT then
-		return 1, 0
-	elseif side == M.SIDE_BOTTOM then
-		return 0, -1
-	end
-	return 0, 1
 end
 
 --- Количество занятых клеток (для статистики).
