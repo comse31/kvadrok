@@ -525,21 +525,33 @@ local function drop_supported(self)
 		and game.has_support(self.board, piece.cells, piece.x, piece.y)
 end
 
+--- Завершает партию: фиксируем причину и показываем подсказку рестарта.
+local function game_over(self, reason)
+	self.state = "gameover"
+	self.piece = nil
+	self.drag = nil
+	self.return_anim = nil
+	clear_piece_nodes(self)
+	self.danger_target = 1
+	self.danger = 1
+	set_hint(self, HINT_GAMEOVER)
+	gui.set_text(self.status, reason)
+	refresh(self)
+end
+
 --- Появление новой фигуры в центре зоны.
 local function spawn(self)
 	local piece = game.random_piece()
 	local x, y = game.spawn_pos(piece)
 
 	if not game.can_place(self.board, piece.cells, x, y) then
-		self.state = "gameover"
-		self.piece = nil
-		self.drag = nil
-		clear_piece_nodes(self)
-		self.danger_target = 1
-		self.danger = 1
-		set_hint(self, HINT_GAMEOVER)
-		gui.set_text(self.status, "Зона занята")
-		refresh(self)
+		game_over(self, "Зона занята")
+		return
+	end
+
+	-- Если деталь некуда поставить с опорой, партия исчерпана.
+	if not game.has_any_drop(self.board, piece) then
+		game_over(self, "Нет места для детали")
 		return
 	end
 

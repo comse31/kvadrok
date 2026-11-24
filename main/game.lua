@@ -193,6 +193,23 @@ function M.has_support(board, cells, px, py)
 	return false
 end
 
+--- Есть ли на поле хоть одна позиция, куда эту фигуру можно поставить:
+--- клетки свободны, зона появления не задета и есть опора.
+function M.has_any_drop(board, piece)
+	local cells = piece.cells
+	local max_x = M.W - piece.w
+	local max_y = M.H - piece.h
+	for py = 0, max_y do
+		for px = 0, max_x do
+			if M.can_drop(board, cells, px, py)
+				and M.has_support(board, cells, px, py) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 --- Позиция появления: по центру зоны.
 function M.spawn_pos(piece)
 	local x = M.ZONE_X + math.floor((M.ZONE - piece.w) / 2)
