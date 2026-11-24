@@ -15,14 +15,29 @@ local MARGIN_SIDE_R = 0.048  -- 20 px при ширине 420
 -- Разрешение одной клетки в текстуре поля.
 local CELL_PX = 8
 
+-- Эталонное разрешение сцены из game.project. Вся геометрия задаётся в этих
+-- единицах, а движок при ADJUST_FIT масштабирует её единым коэффициентом по
+-- меньшей стороне окна. Поэтому при изменении размера окна пропорции поля и
+-- интерфейса не меняются, а свободное место остаётся полями по краям.
+local BASE_W = 420
+local BASE_H = 800
+
 local TEX_ID = "board_tx"
 local TEX_W = N * CELL_PX
 local TEX_H = M * CELL_PX
 
--- Толщина контура и свечения — в долях от размера клетки поля.
-local FRAME_T_R = 0.26
-local FRAME_GLOW_T_R = 1.05
-local FRAME_GLOW_ALPHA = 0.16
+-- Контур центральной зоны — линия толщиной ровно 1 игровой пиксель, то есть
+-- 1 пиксель текстуры поля (1/8 клетки). Она лежит на пиксельной сетке текстуры
+-- и не «расплывается» при масштабировании, оставаясь тонкой и аккуратной.
+local FRAME_T = 1
+local FRAME_ALPHA = 0.72
+
+-- Единственный слабый ореол снаружи контура (радиус в игровых пикселях).
+-- Одно кольцо вместо нескольких ступеней: свечение читается как мягкая тень,
+-- без видимых прямоугольных полос и без двойной прозрачности в углах.
+local FRAME_GLOWS = {
+	{ t = 3, alpha = 0.055 },
+}
 
 -- Длительность анимации возврата детали в центр (секунды).
 local RETURN_DURATION = 0.22
@@ -146,6 +161,8 @@ local function prepare_piece_colors()
 end
 
 --- Собирает буфер текстуры по текущему состоянию поля.
+--- В логике ряд 0 — нижний, а строки текстуры идут сверху вниз, поэтому
+--- ряды перебираются в обратном порядке: иначе поле отрисовывается зеркально.
 local function build_buffer(self)
 	local rows = {}
 	local board = self.board
@@ -153,7 +170,7 @@ local function build_buffer(self)
 	local empty_block = BLOCKS.empty
 	local zone_block = BLOCKS.zone
 
-	for y = 0, M - 1 do
+	for y = M - 1, 0, -1 do
 		local row = board[y]
 		-- Строки текстуры, соответствующие этому ряду клеток.
 		local buffers = {}
@@ -198,10 +215,12 @@ local function upload_board(self)
 	end
 end
 
+--- Узлы используют ADJUST_FIT, чтобы движок масштабировал их равномерно по обеим
+--- осям: при изменении размера окна пропорции поля и интерфейса не меняются.
 local function make_box(pos, size, color)
 	local node = gui.new_box_node(pos, size)
 	gui.set_pivot(node, gui.PIVOT_SW)
-	gui.set_adjust_mode(node, gui.ADJUST_STRETCH)
+	gui.set_adjust_mode(node, gui.ADJUST_FIT)
 	gui.set_color(node, color)
 	return node
 end
@@ -210,7 +229,7 @@ local function make_label(pos, text, pivot, color)
 	local node = gui.new_text_node(pos, text)
 	gui.set_font(node, "main")
 	gui.set_pivot(node, pivot)
-	gui.set_adjust_mode(node, gui.ADJUST_STRETCH)
+	gui.set_adjust_mode(node, gui.ADJUST_FIT)
 	gui.set_color(node, color or COLOR_TEXT)
 	return node
 end
@@ -235,33 +254,38 @@ local function danger_color(value)
 	)
 end
 
---- Пересчитывает геометрию поля под текущий размер сцены.
---- Поле всегда квадратное, а все его элементы масштабируются вместе с ним.
+--- Пересчитывает геометрию поля.
+--- Вся геометрия задаётся в эталонных единицах сцены (BASE_W x BASE_H) и не
+--- зависит от фактического размера окна: узлы используют gui.ADJUST_FIT, поэтому
+--- движок масштабирует их единым коэффициентом. Пропорции поля и интерфейса
+--- при изменении размера окна остаются неизменными.
+--- Также запоминается фактический размер окна и параметры вписывания сцены,
+--- чтобы корректно переводить координаты касаний в координаты сцены.
 local function relayout(self)
-	local w = gui.get_width()
-	local h = gui.get_height()
+	local margin_top = BASE_H * MARGIN_TOP_R
+	local margin_bottom = BASE_H * MARGIN_BOTTOM_R
+	local margin_side = BASE_W * MARGIN_SIDE_R
 
-	local margin_top = h * MARGIN_TOP_R
-	local margin_bottom = h * MARGIN_BOTTOM_R
-	local margin_side = w * MARGIN_SIDE_R
-
-	local avail_w = w - margin_side * 2
-	local avail_h = h - margin_top - margin_bottom
-	local size = math.max(64, math.min(avail_w, avail_h))
+	local avail_w = BASE_W - margin_side * 2
+	local avail_h = BASE_H - margin_top - margin_bottom
+	local size = math.min(avail_w, avail_h)
+	if size < 64 then
+		size = 64
+	end
 
 	self.cell = size / N
 	self.board_size = size
-	self.origin_x = (w - size) / 2
+	self.origin_x = (BASE_W - size) * 0.5
 	self.origin_y = margin_bottom + math.max(0, (avail_h - size) / 2)
 
 	self.margin_top = margin_top
 	self.margin_bottom = margin_bottom
-	-- Толщины линий контура пропорциональны клетке поля.
-	self.frame_t = math.max(1.5, self.cell * FRAME_T_R)
-	self.frame_glow_t = math.max(self.frame_t, self.cell * FRAME_GLOW_T_R)
+	-- 1 игровой пиксель = 1 пиксель текстуры поля; на этой сетке лежит контур.
+	self.gp = self.cell / CELL_PX
 
-	self.scene_w = w
-	self.scene_h = h
+	-- Эталонные размеры сцены: HUD считает координаты в этих единицах.
+	self.scene_w = BASE_W
+	self.scene_h = BASE_H
 end
 
 local function build_board_node(self)
@@ -290,50 +314,69 @@ end
 local function clear_frame(self)
 	if self.frame then
 		for i = 1, #self.frame do
-			gui.delete_node(self.frame[i])
+			local group = self.frame[i]
+			for j = 1, #group.nodes do
+				gui.delete_node(group.nodes[j])
+			end
 		end
 		self.frame = nil
 	end
 end
 
---- Создаёт подложку и контур центральной зоны появления фигур.
+--- Создаёт контур центральной зоны появления фигур.
+--- Границы зоны лежат на пиксельной сетке текстуры поля: толщина линии —
+--- ровно 1 игровой пиксель, поэтому она остаётся тонкой при любом масштабе.
 local function build_frame(self)
 	clear_frame(self)
 
-	local zx = self.origin_x + ZONE_X * self.cell
-	local zy = self.origin_y + ZONE_Y * self.cell
-	local zs = ZONE * self.cell
-
-	local t = self.frame_t
-	local g = self.frame_glow_t
+	local gp = self.gp or (self.cell / CELL_PX)
+	local x = self.origin_x + ZONE_X * self.cell
+	local y = self.origin_y + ZONE_Y * self.cell
+	local w = ZONE * self.cell
+	local h = w
 	local color = danger_color(self.danger or 0)
-	local glow = vmath.vector4(color.x, color.y, color.z, FRAME_GLOW_ALPHA)
+	local groups = {}
 
-	local bars = {
-		{ zx - t / 2, zy - t / 2, zs + t, t }, -- нижняя
-		{ zx - t / 2, zy + zs - t / 2, zs + t, t }, -- верхняя
-		{ zx - t / 2, zy - t / 2, t, zs + t }, -- левая
-		{ zx + zs - t / 2, zy - t / 2, t, zs + t }, -- правая
-	}
-
-	local glows = {
-		{ zx - g / 2, zy - g / 2, zs + g, g },
-		{ zx - g / 2, zy + zs - g / 2, zs + g, g },
-		{ zx - g / 2, zy - g / 2, g, zs + g },
-		{ zx + zs - g / 2, zy - g / 2, g, zs + g },
-	}
-
-	local nodes = {}
-	for i = 1, #glows do
-		local b = glows[i]
-		nodes[#nodes + 1] = make_box(vmath.vector3(b[1], b[2], 0.25), vmath.vector3(b[3], b[4], 0), glow)
+	-- Ореолы: кольца снаружи зоны, от внешнего к внутреннему.
+	for i = #FRAME_GLOWS, 1, -1 do
+		local glow = FRAME_GLOWS[i]
+		local inner_r = ((i > 1) and FRAME_GLOWS[i - 1].t or 0) * gp
+		local outer_r = glow.t * gp
+		local band = outer_r - inner_r
+		local bars = {
+			{ x - outer_r, y - outer_r, w + outer_r * 2, band }, -- нижняя
+			{ x - outer_r, y + h + inner_r, w + outer_r * 2, band }, -- верхняя
+			{ x - outer_r, y - inner_r, band, h + inner_r * 2 }, -- левая
+			{ x + w + inner_r, y - inner_r, band, h + inner_r * 2 }, -- правая
+		}
+		local c = vmath.vector4(color.x, color.y, color.z, glow.alpha)
+		local nodes = {}
+		for j = 1, #bars do
+			local b = bars[j]
+			nodes[j] = make_box(vmath.vector3(b[1], b[2], 0.2), vmath.vector3(b[3], b[4], 0), c)
+		end
+		groups[#groups + 1] = { alpha = glow.alpha, nodes = nodes }
 	end
+
+	-- Сама линия: ровно 1 игровой пиксель по внутреннему краю зоны.
+	-- Углы закрыты горизонтальными полосами, поэтому швов нет, а ореолы
+	-- начинаются снаружи и не накладываются на линию.
+	local t = FRAME_T * gp
+	local bars = {
+		{ x, y, w, t }, -- нижняя
+		{ x, y + h - t, w, t }, -- верхняя
+		{ x, y + t, t, h - t * 2 }, -- левая
+		{ x + w - t, y + t, t, h - t * 2 }, -- правая
+	}
+	local line_color = vmath.vector4(color.x, color.y, color.z, FRAME_ALPHA)
+	local nodes = {}
 	for i = 1, #bars do
 		local b = bars[i]
-		nodes[#nodes + 1] = make_box(vmath.vector3(b[1], b[2], 0.3), vmath.vector3(b[3], b[4], 0), color)
+		nodes[i] = make_box(vmath.vector3(b[1], b[2], 0.3), vmath.vector3(b[3], b[4], 0), line_color)
 	end
+	groups[#groups + 1] = { alpha = FRAME_ALPHA, nodes = nodes }
 
-	self.frame = nodes
+	self.frame = groups
 end
 
 --- Перекрашивает контур зоны под текущее значение опасности.
@@ -342,13 +385,12 @@ local function update_frame(self)
 		return
 	end
 	local color = danger_color(self.danger or 0)
-	local glow = vmath.vector4(color.x, color.y, color.z, FRAME_GLOW_ALPHA)
-	-- [1..4] — свечение, [5..8] — сам контур.
-	for i = 1, 4 do
-		gui.set_color(self.frame[i], glow)
-	end
-	for i = 5, #self.frame do
-		gui.set_color(self.frame[i], color)
+	for i = 1, #self.frame do
+		local group = self.frame[i]
+		local c = vmath.vector4(color.x, color.y, color.z, group.alpha)
+		for j = 1, #group.nodes do
+			gui.set_color(group.nodes[j], c)
+		end
 	end
 end
 
@@ -445,7 +487,33 @@ local function build_piece_nodes(self)
 	snap_piece_nodes(self)
 end
 
---- HUD: позиции в долях размера сцены, шрифт масштабируется вместе с полем.
+--- Экранные координаты указателя (физические пиксели экрана).
+local function raw_screen_xy(action)
+	local entry = action.touch and action.touch[1]
+	local sx = action.screen_x or (entry and entry.screen_x)
+	local sy = action.screen_y or (entry and entry.screen_y)
+	return sx, sy
+end
+
+--- Координаты указателя в системе координат сцены (эталонные единицы 420x800).
+--- Движок отдаёт action.x/y растянутыми на всё окно (как при ADJUST_STRETCH),
+--- что не совпадает с визуальным положением узлов при ADJUST_FIT. Поэтому берём
+--- экранные координаты и переводим их через gui.screen_to_local(): для корневого
+--- узла функция возвращает координаты сцены, уже учитывая adjust-режим,
+--- масштаб, поля (letterbox), safe-area и DPI.
+local function touch_xy(self, action)
+	local sx, sy = raw_screen_xy(action)
+	if sx ~= nil and sy ~= nil and self.board_node then
+		local p = gui.screen_to_local(self.board_node, vmath.vector3(sx, sy, 0))
+		return p.x, p.y
+	end
+
+	-- Запасной путь, если экранных координат нет: логические координаты экшена.
+	return raw_touch_xy(action)
+end
+
+--- HUD: координаты заданы в эталонных единицах сцены (BASE_W x BASE_H),
+--- поэтому их пропорции не зависят от фактического размера окна.
 local function build_hud(self)
 	local w = self.scene_w
 	local h = self.scene_h
@@ -456,9 +524,6 @@ local function build_hud(self)
 		gui.delete_node(self.hint)
 		gui.delete_node(self.status)
 	end
-
-	-- Размер шрифта пропорционален стороне поля (22 px при поле ~420 px).
-	local scale = math.max(0.6, self.board_size / 420)
 
 	self.title = make_label(vmath.vector3(w / 2, h - h * 0.065, 0.1), "КВАДРОК", gui.PIVOT_N, COLOR_TEXT)
 	self.score = make_label(vmath.vector3(w / 2, h - h * 0.11, 0.1), "", gui.PIVOT_N, COLOR_TEXT_DIM)
@@ -471,9 +536,12 @@ local function build_hud(self)
 		COLOR_TEXT
 	)
 
+	-- Размер шрифта пропорционален стороне поля (22 px при поле ~420 px).
+	local font_scale = math.max(0.6, self.board_size / 420)
+
 	local labels = { self.title, self.score, self.status, self.hint }
 	for i = 1, #labels do
-		gui.set_scale(labels[i], vmath.vector3(scale, scale, 1))
+		gui.set_scale(labels[i], vmath.vector3(font_scale, font_scale, 1))
 	end
 end
 
@@ -703,6 +771,18 @@ function update(self, dt)
 	end
 end
 
+--- Логические координаты указателя: сначала плоские поля action, затем touch.
+local function raw_touch_xy(action)
+	if action.x ~= nil and action.y ~= nil then
+		return action.x, action.y
+	end
+	local entry = action.touch and action.touch[1]
+	if entry and entry.x ~= nil and entry.y ~= nil then
+		return entry.x, entry.y
+	end
+	return nil, nil
+end
+
 --- Клетка поля под точкой касания (дробные координаты в клетках).
 local function board_point(self, x, y)
 	return (x - self.origin_x) / self.cell, (y - self.origin_y) / self.cell
@@ -716,18 +796,6 @@ local function touch_id(action)
 	end
 	local entry = action.touch and action.touch[1]
 	return entry and entry.id or nil
-end
-
---- Координаты указателя: сначала плоские поля action, затем запись touch.
-local function touch_xy(action)
-	if action.x ~= nil and action.y ~= nil then
-		return action.x, action.y
-	end
-	local entry = action.touch and action.touch[1]
-	if entry and entry.x ~= nil and entry.y ~= nil then
-		return entry.x, entry.y
-	end
-	return nil, nil
 end
 
 --- Есть ли клетка (cx, cy) в составе детали.
@@ -760,12 +828,12 @@ function on_input(self, action_id, action)
 			return true
 		end
 
-		local ax, ay = touch_xy(action)
-		if ax == nil then
+		local sx, sy = touch_xy(self, action)
+		if sx == nil then
 			return true
 		end
 
-		local bx, by = board_point(self, ax, ay)
+		local bx, by = board_point(self, sx, sy)
 		local cx = math.floor(bx)
 		local cy = math.floor(by)
 		if not piece_has_cell(piece, cx, cy) then
@@ -792,12 +860,22 @@ function on_input(self, action_id, action)
 		return true
 	end
 
+	-- При отпускании позицию не пересчитываем: событие `released` может прийти
+	-- с координатами, отличающимися от последнего движения (например, за
+	-- пределами canvas), из-за чего деталь «прыгала» бы перед фиксацией.
+	-- Фиксируем уже достигнутую квантизованную позицию.
+	if action.released then
+		self.drag = nil
+		release_piece(self)
+		return true
+	end
+
 	-- Defold присылает экшен каждый кадр, пока палец на экране: отдельного
 	-- признака `moved` у touch-экшена нет, поэтому двигаем деталь по
 	-- актуальным координатам указателя.
-	local ax, ay = touch_xy(action)
-	if ax ~= nil then
-		local bx, by = board_point(self, ax, ay)
+	local sx, sy = touch_xy(self, action)
+	if sx ~= nil then
+		local bx, by = board_point(self, sx, sy)
 		-- Квантизация: деталь двигается по клеткам, оставаясь под пальцем.
 		local want_x = math.floor(bx - self.drag.off_x + 0.5)
 		local want_y = math.floor(by - self.drag.off_y + 0.5)
@@ -825,11 +903,6 @@ function on_input(self, action_id, action)
 				set_hint(self, ok and HINT_DRAG_OK or HINT_DRAG_BAD)
 			end
 		end
-	end
-
-	if action.released then
-		self.drag = nil
-		release_piece(self)
 	end
 
 	return true
