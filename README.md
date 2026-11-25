@@ -169,3 +169,107 @@ K кубиков»** — сколько кубиков уже убрано с п
 Открыть проект в Defold Editor и нажать **Project → Build** (`F7`), либо собрать HTML5-версию
 через **Project → Build HTML5**. Игра использует только встроенные ресурсы движка и
 собственные ассеты из `assets/`.
+
+Сборка из консоли (headless, Bob) в Docker описана в разделе
+[CI и деплой](#ci-и-деплой).
+
+## CI и деплой
+
+Сборка и развёртывание выполняются в GitHub Actions на **self-hosted** раннере
+(`runs-on: [self-hosted]`), на котором установлен Docker. Контейнер игры
+запускается на Docker-демоне раннера (реальная машина), поэтому продолжает
+работать после завершения workflow.
+
+### Почему bob.jar не скачивается с d.defold.com
+
+Прямое скачивание `bob.jar` (~230 МБ) с `d.defold.com` на этом хосте идёт
+десятки-сотни байт в секунду, из-за чего сборка падала по таймауту. Решение
+(взято из проекта `bumpy`):
+
+1. `bob.jar` один раз публикуется ассетом GitHub Release с тегом
+   `bob-jar-<sha1>` — GitHub отдаёт его быстро;
+2. образ-сборщик (`docker/bob-builder.Dockerfile`) скачивает `bob.jar` из этого
+   релиза (резерв — `d.defold.com` с жёстким лимитом скорости);
+3. образ-сборщик публикуется в GitHub Container Registry, и во время деплоя он
+   только скачивается (`docker pull`) — ни `docker build` образа-сборщика, ни
+   загрузок с `d.defold.com` в деплое нет.
+
+Движки HTML5 (`libexec/wasm-web`) лежат **внутри** `bob.jar`, поэтому при сборке
+бандла в сеть никто не ходит.
+
+### Workflow
+
+| Файл | Триггер | Назначение |
+| --- | --- | --- |
+| [`.github/workflows/fetch-bob.yml`](.github/workflows/fetch-bob.yml) | вручную | Скачать `bob.jar` стабильной версии Defold и приложить к релизу `bob-jar-<sha1>`. |
+| [`.github/workflows/build-bob-image.yml`](.github/workflows/build-bob-image.yml) | вручную | Собрать образ-сборщик (JDK 25 + `bob.jar` + библиотеки X11/GL) и опубликовать в `ghcr.io/<owner>/kvadrok-bob-builder:<sha1>`. |
+| [`.github/workflows/deploy-master.yml`](.github/workflows/deploy-master.yml) | push в `main`, вручную | Собрать HTML5-бандл (`wasm-web`), упаковать в nginx-образ и развернуть контейнер `kvadrok-web` на порту `8098`. |
+
+### Первичная настройка (один раз)
+
+1. **Раннер**: на машине с Docker зарегистрировать self-hosted раннер
+   репозитория (`Settings → Actions → Runners → New self-hosted runner`) и
+   запустить его как службу. В проекте он установлен в
+   `~/actions-runner-kvadrok` и работает через systemd user unit
+   `kvadrok-runner.service` (включён `loginctl enable-linger`, иначе служба
+   останавливается при выходе пользователя):
+   ```bash
+   systemctl --user enable --now kvadrok-runner.service
+   ```
+2. **bob.jar в релизе**: Actions → **Fetch bob.jar (manual)** → Run workflow.
+   Без этого шага образ-сборщик будет тянуть `bob.jar` с медленного
+   `d.defold.com`.
+3. **Образ-сборщик**: Actions → **Build & Publish bob-builder image** →
+   Run workflow. Тег — sha1 стабильной версии Defold (см.
+   `https://d.defold.com/stable/info.json`). Повторять при обновлении Defold.
+
+После этого каждый push в `main` собирает и переразворачивает игру:
+`http://<хост-раннера>:8098/`.
+
+### Локальная проверка в Docker
+
+```bash
+# 1. Образ-сборщик (bob.jar берётся из релиза bob-jar-<sha1>)
+docker build \
+  --build-arg BOB_SHA1=d295ed4edff2e49072719835713e625f409849f1 \
+  --build-arg BOB_RELEASE_REPO=comse31/kvadrok \
+  -f docker/bob-builder.Dockerfile \
+  -t kvadrok-bob-builder:25-jdk .
+
+# 2. HTML5-бандл (--architectures wasm-web: только однопоточный движок,
+#    иначе bob полезет за wasm_pthread-web на d.defold.com)
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD":/project -w /project kvadrok-bob-builder:25-jdk \
+  java -jar /opt/bob/bob.jar --root . --platform wasm-web \
+    --architectures wasm-web --archive --variant release \
+    --bundle-output dist/web resolve build bundle
+
+# 3. nginx-образ и запуск
+docker build -f docker/Dockerfile -t kvadrok-web:test .
+docker run --rm -p 8098:80 kvadrok-web:test
+# открыть http://localhost:8098/
+```
+
+`docker/nginx.conf` отдаёт `.wasm` с `Content-Type: application/wasm` (без
+этого браузер не запускает движок) и сжимает `.js`/`.html`.
+
+Для сборки через Defold API редактора используется
+`POST http://127.0.0.1:<порт>/bob` (порт — в `.internal/editor.port`, токен — в
+`.internal/editor.token`) с телом:
+
+```json
+{
+  "options": {
+    "platform": "wasm-web",
+    "architectures": "wasm-web",
+    "archive": true,
+    "variant": "release",
+    "bundle-output": "dist/web",
+    "root": "."
+  },
+  "commands": ["resolve", "build", "bundle"]
+}
+```
+
+Обратите внимание: `architectures` передаётся строкой. Массив `["wasm-web"]`
+bob отклоняет (`Invalid bob option supplied`).

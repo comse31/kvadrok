@@ -1,6 +1,7 @@
 /.editor_settings
 /.internal
 /build
+/dist
 .externalToolBuilders
 .DS_Store
 Thumbs.db
@@ -9,3 +10,6 @@ Thumbs.db
 .project
 .cproject
 builtins
+/kvadrok_progress
+/kvadrok.iml
+.idea/

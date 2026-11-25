@@ -1,0 +1,109 @@
+# Ручная задача: скачать bob.jar (Defold headless) и приложить его к GitHub Release.
+#
+# Зачем это нужно
+# ---------------
+# Прямое скачивание bob.jar с d.defold.com на этом хосте идёт десятки-сотни
+# байт в секунду (файл ~230 МБ), из-за чего сборка в CI падала по таймауту.
+# GitHub Releases отдаёт те же данные быстро, поэтому bob.jar один раз
+# публикуется как ассет релиза `bob-jar-<sha1>`, а образ-сборщик
+# (docker/bob-builder.Dockerfile) скачивает его уже оттуда.
+#
+# Что делает задача
+# -----------------
+#   1. Определяет версию Defold (sha1): из входного параметра или stable/info.json.
+#   2. Скачивает bob.jar этой версии (GitHub Releases defold/defold — быстро;
+#      d.defold.com — резервный источник).
+#   3. Публикует его ассетом релиза с тегом `bob-jar-<sha1>`.
+#
+# Запуск: Actions → "Fetch bob.jar (manual)" → Run workflow.
+
+name: Fetch bob.jar (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      defold_sha1:
+        description: "sha1 версии Defold. Пусто — взять текущую stable с d.defold.com"
+        required: false
+        default: ""
+      defold_version:
+        description: "Тег релиза Defold на GitHub (напр. 1.14.0). Пусто — stable-версия"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-bob:
+    name: Скачать bob.jar и загрузить в Release
+    # Self-hosted раннер (см. AGENTS.md).
+    runs-on: [self-hosted]
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Определение версии Defold (sha1)
+        id: defold
+        run: |
+          set -euo pipefail
+          SHA1="${{ inputs.defold_sha1 }}"
+          if [ -z "${SHA1}" ]; then
+            SHA1="$(curl -fsSL --max-time 60 https://d.defold.com/stable/info.json \
+              | python3 -c 'import sys, json; print(json.load(sys.stdin)["sha1"])')"
+          fi
+          echo "sha1=${SHA1}" >> "$GITHUB_OUTPUT"
+          echo "Версия Defold (sha1): ${SHA1}"
+
+      - name: Определение тега релиза Defold на GitHub
+        id: release
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.defold_version }}"
+          if [ -z "${TAG}" ]; then
+            # Тег релиза defold/defold, соответствующий текущей stable-версии.
+            TAG="$(curl -fsSL --max-time 60 https://d.defold.com/stable/info.json \
+              | python3 -c 'import sys, json; print(json.load(sys.stdin)["version"])')"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Тег релиза Defold: ${TAG}"
+
+      - name: Скачивание bob.jar
+        # Сначала GitHub Releases (быстро). Если версия ещё не выложена там —
+        # резервное скачивание с d.defold.com с ограничением по скорости, чтобы
+        # не зависнуть на медленной загрузке.
+        run: |
+          set -euxo pipefail
+          TAG="${{ steps.release.outputs.tag }}"
+          SHA1="${{ steps.defold.outputs.sha1 }}"
+          GH_URL="https://github.com/defold/defold/releases/download/${TAG}/bob.jar"
+          echo "Источник 1: ${GH_URL}"
+          if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 600 \
+              --speed-time 60 --speed-limit 200000 \
+              -o bob.jar "${GH_URL}"; then
+            echo "GitHub Release ${TAG} недоступен — качаю с d.defold.com"
+            curl -fsSL --retry 2 --connect-timeout 15 --max-time 1800 \
+              -o bob.jar "https://d.defold.com/archive/${SHA1}/bob/bob.jar"
+          fi
+          ls -lh bob.jar
+          java -jar bob.jar --version
+
+      - name: Публикация bob.jar как ассета GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA1="${{ steps.defold.outputs.sha1 }}"
+          TAG="bob-jar-${SHA1}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} уже существует — обновляю ассет"
+            gh release upload "${TAG}" bob.jar --clobber
+          else
+            echo "Создаю Release ${TAG} с ассетом bob.jar"
+            gh release create "${TAG}" bob.jar \
+              --title "bob.jar (Defold ${SHA1})" \
+              --notes "Headless-сборщик Defold ${SHA1} для CI (загружено вручную)."
+          fi
+          echo "Ассет опубликован: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
