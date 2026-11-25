@@ -1,8 +1,10 @@
 --- Игровая логика «Квадрок» (чистый Lua, без зависимостей от движка).
---- Поле начинается с 20x20 и растёт на 2 клетки после каждой победы
---- (20, 22, 24 … 30) через M.set_field_size().
---- В центре поля находится квадрат 5x5, выделенный контуром:
---- именно в нём появляются новые фигуры-тетромино.
+--- Поле начинается с 16x16 и растёт по уровням после каждой победы:
+--- 16 → 18 → 20 → 21 → 23 → 25 (максимум) через M.set_field_size().
+--- В центре поля находится стартовый квадрат, выделенный контуром:
+--- 4x4 на полях 16–20 и 5x5 на полях 21–25. Именно в нём появляются новые
+--- фигуры: тетромино (4 кубика) для стартового квадрата 4x4 и пентамино
+--- (5 кубиков) для стартового квадрата 5x5.
 ---
 --- Игрок тапом захватывает фигуру и тащит её в любом направлении. Пока фигура
 --- в руке, её положение привязано к клеткам поля (квантизация). Отпущенная
@@ -17,12 +19,26 @@
 
 local M = {}
 
+--- Размеры поля по уровням: 16, 18, 20 — со стартовым квадратом 4x4,
+--- затем 21, 23, 25 — со стартовым квадратом 5x5 (максимальный размер поля).
+M.LEVELS = { 16, 18, 20, 21, 23, 25 }
+
 --- Минимальный размер поля — стартовый уровень.
-M.MIN_FIELD_SIZE = 20
+M.MIN_FIELD_SIZE = M.LEVELS[1]
 --- Максимальный размер поля: дальше усложнять некуда.
-M.MAX_FIELD_SIZE = 30
---- Шаг роста поля после победы (клетки).
-M.FIELD_STEP = 2
+M.MAX_FIELD_SIZE = M.LEVELS[#M.LEVELS]
+
+--- Наибольший размер поля со стартовым квадратом 4x4.
+--- Начиная со следующего уровня (21x21) стартовый квадрат — 5x5.
+M.ZONE_SWITCH_SIZE = 20
+
+--- Сторона стартового квадрата для очередного размера поля.
+function M.zone_for_size(size)
+	if size <= M.ZONE_SWITCH_SIZE then
+		return 4
+	end
+	return 5
+end
 
 --- Сторона игрового поля в клетках (текущий уровень).
 M.FIELD_SIZE = M.MIN_FIELD_SIZE
@@ -33,37 +49,48 @@ M.H = M.FIELD_SIZE
 --- Сколько кубиков нужно разобрать за партию: S * S * 2 / 4, где S = FIELD_SIZE.
 M.TOTAL_CELLS = math.floor(M.FIELD_SIZE * M.FIELD_SIZE * 2 / 4)
 
---- Сторона центрального квадрата появления фигур (в клетках).
-M.ZONE = 5
+--- Сторона стартового квадрата (зоны появления фигур) в клетках.
+M.ZONE = M.zone_for_size(M.FIELD_SIZE)
 
 --- Левый нижний угол зоны появления.
 M.ZONE_X = math.floor((M.W - M.ZONE) / 2)
 M.ZONE_Y = math.floor((M.H - M.ZONE) / 2)
 
---- Приводит размер поля к допустимому уровню: 20, 22, … 30.
+--- Приводит размер поля к допустимому уровню: 16, 18, 20, 21, 23, 25.
+--- Для промежуточных значений берётся ближайший уровень не больше заданного:
+--- так корректно читается прогресс, записанный прежней версией игры.
 function M.normalize_field_size(size)
-	size = tonumber(size) or M.MIN_FIELD_SIZE
-	size = math.floor(size)
-	size = size - (size - M.MIN_FIELD_SIZE) % M.FIELD_STEP
-	if size < M.MIN_FIELD_SIZE then
-		size = M.MIN_FIELD_SIZE
-	elseif size > M.MAX_FIELD_SIZE then
-		size = M.MAX_FIELD_SIZE
+	size = tonumber(size)
+	if not size then
+		return M.MIN_FIELD_SIZE
 	end
-	return size
+	size = math.floor(size)
+	if size <= M.MIN_FIELD_SIZE then
+		return M.MIN_FIELD_SIZE
+	end
+
+	local best = M.MIN_FIELD_SIZE
+	for i = 1, #M.LEVELS do
+		if M.LEVELS[i] <= size then
+			best = M.LEVELS[i]
+		end
+	end
+	return best
 end
 
 --- Делает поле заданного размера. Все функции ниже читают M.W, M.H,
---- M.ZONE_X, M.ZONE_Y и M.TOTAL_CELLS динамически, поэтому смена размера
---- сразу применяется ко всей логике. Возвращает фактический размер.
+--- M.ZONE, M.ZONE_X, M.ZONE_Y и M.TOTAL_CELLS динамически, поэтому смена
+--- размера сразу применяется ко всей логике. Возвращает фактический размер.
 function M.set_field_size(size)
 	size = M.normalize_field_size(size)
 	M.FIELD_SIZE = size
 	M.W = size
 	M.H = size
 	M.TOTAL_CELLS = math.floor(size * size * 2 / 4)
+	M.ZONE = M.zone_for_size(size)
 	M.ZONE_X = math.floor((M.W - M.ZONE) / 2)
 	M.ZONE_Y = math.floor((M.H - M.ZONE) / 2)
+	M.apply_zone_shapes()
 	return size
 end
 
@@ -71,10 +98,12 @@ end
 --- Функция ничего не меняет: размер применяется через M.set_field_size().
 function M.next_field_size(size)
 	size = M.normalize_field_size(size)
-	if size >= M.MAX_FIELD_SIZE then
-		return nil
+	for i = 1, #M.LEVELS do
+		if M.LEVELS[i] > size then
+			return M.LEVELS[i]
+		end
 	end
-	return size + M.FIELD_STEP
+	return nil
 end
 
 --- Радиус (в клетках), в пределах которого близость фигур влияет на цвет контура.
@@ -86,7 +115,8 @@ M.DANGER_SATURATION = 10
 --- Считать ли касание углом (по диагонали) опорой для фигуры.
 M.TOUCH_DIAGONAL = false
 
-local BASE_SHAPES = {
+--- Тетромино (4 кубика) — детали для стартового квадрата 4x4.
+local TETROMINOES = {
 	{ cells = { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 } }, color = 1 }, -- I
 	{ cells = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } }, color = 2 }, -- O
 	{ cells = { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 1, 1 } }, color = 3 }, -- T
@@ -94,6 +124,22 @@ local BASE_SHAPES = {
 	{ cells = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 2, 1 } }, color = 5 }, -- Z
 	{ cells = { { 0, 0 }, { 0, 1 }, { 1, 1 }, { 2, 1 } }, color = 6 }, -- J
 	{ cells = { { 2, 0 }, { 0, 1 }, { 1, 1 }, { 2, 1 } }, color = 7 }, -- L
+}
+
+--- Пентамино (5 кубиков) — детали для стартового квадрата 5x5.
+local PENTOMINOES = {
+	{ cells = { { 1, 0 }, { 2, 0 }, { 0, 1 }, { 1, 1 }, { 1, 2 } }, color = 1 }, -- F
+	{ cells = { { 0, 0 }, { 0, 1 }, { 0, 2 }, { 0, 3 }, { 0, 4 } }, color = 2 }, -- I
+	{ cells = { { 0, 0 }, { 0, 1 }, { 0, 2 }, { 0, 3 }, { 1, 3 } }, color = 3 }, -- L
+	{ cells = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 }, { 0, 2 } }, color = 4 }, -- P
+	{ cells = { { 1, 0 }, { 1, 1 }, { 0, 1 }, { 0, 2 }, { 0, 3 } }, color = 5 }, -- N
+	{ cells = { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 1, 1 }, { 1, 2 } }, color = 6 }, -- T
+	{ cells = { { 0, 0 }, { 2, 0 }, { 0, 1 }, { 1, 1 }, { 2, 1 } }, color = 7 }, -- U
+	{ cells = { { 0, 0 }, { 0, 1 }, { 0, 2 }, { 1, 2 }, { 2, 2 } }, color = 1 }, -- V
+	{ cells = { { 2, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 }, { 0, 2 } }, color = 2 }, -- W
+	{ cells = { { 1, 0 }, { 0, 1 }, { 1, 1 }, { 2, 1 }, { 1, 2 } }, color = 3 }, -- X
+	{ cells = { { 0, 0 }, { 0, 1 }, { 0, 2 }, { 0, 3 }, { 1, 1 } }, color = 4 }, -- Y
+	{ cells = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 1, 2 }, { 2, 2 } }, color = 5 }, -- Z
 }
 
 local function normalize(cells)
@@ -131,20 +177,43 @@ local function signature(cells)
 	return table.concat(parts, ";")
 end
 
-M.SHAPES = {}
-for i = 1, #BASE_SHAPES do
-	local shape = { variants = {}, color = BASE_SHAPES[i].color }
-	local seen = {}
-	local cells = normalize(BASE_SHAPES[i].cells)
-	for _ = 1, 4 do
-		local sig = signature(cells)
-		if not seen[sig] then
-			seen[sig] = true
-			shape.variants[#shape.variants + 1] = cells
+--- Собирает набор фигур со всеми уникальными поворотами.
+local function build_shapes(base)
+	local shapes = {}
+	for i = 1, #base do
+		local shape = { variants = {}, color = base[i].color }
+		local seen = {}
+		local cells = normalize(base[i].cells)
+		for _ = 1, 4 do
+			local sig = signature(cells)
+			if not seen[sig] then
+				seen[sig] = true
+				shape.variants[#shape.variants + 1] = cells
+			end
+			cells = rotate_cw(cells)
 		end
-		cells = rotate_cw(cells)
+		shapes[i] = shape
 	end
-	M.SHAPES[i] = shape
+	return shapes
+end
+
+--- Наборы деталей: тетромино для стартового квадрата 4x4,
+--- пентамино — для стартового квадрата 5x5.
+M.SHAPES_TETROMINO = build_shapes(TETROMINOES)
+M.SHAPES_PENTOMINO = build_shapes(PENTOMINOES)
+
+--- Текущий набор деталей (по умолчанию — тетромино, как на первом уровне).
+M.SHAPES = M.SHAPES_TETROMINO
+
+--- Подбирает набор деталей под размер стартового квадрата:
+--- в квадрате 4x4 детали из 4 кубиков, в квадрате 5x5 — из 5 кубиков.
+function M.apply_zone_shapes()
+	if M.ZONE >= 5 then
+		M.SHAPES = M.SHAPES_PENTOMINO
+	else
+		M.SHAPES = M.SHAPES_TETROMINO
+	end
+	return M.SHAPES
 end
 
 function M.new_board()
