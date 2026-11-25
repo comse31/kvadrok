@@ -120,8 +120,8 @@ local LOSE_TITLE = "Не беда,\nпопробуй снова"
 local LOSE_HINT = "Тап — сыграть ещё раз"
 local WIN_TITLE = "Получилось!\nНу тогда усложняем"
 local WIN_HINT = "Тап — следующее поле"
-local WIN_MAX_TITLE = "Получилось!\nЭто максимум"
-local WIN_MAX_HINT = "Тап — сыграть ещё раз"
+local WIN_MAX_TITLE = "Получилось!\nПоле уже максимум"
+local WIN_MAX_HINT = "Тап — цель +100 кубиков"
 
 local function rgb_str(rgb)
 	return string.char(rgb[1], rgb[2], rgb[3])
@@ -1055,7 +1055,7 @@ local function update_hud(self)
 	end
 	self.shown_removed = removed
 
-	local left = game.TOTAL_CELLS - removed
+	local left = game.total_cells() - removed
 	if left < 0 then
 		left = 0
 	end
@@ -1248,10 +1248,11 @@ end
 -- Предварительные объявления: эти функции определяются ниже, но нужны здесь.
 local restart, advance_level
 
---- Реакция на тап после окончания партии: победа ведёт на следующий уровень,
---- поражение — на повтор текущего.
+--- Реакция на тап после окончания партии: любая победа (в том числе на
+--- максимальном поле, где растёт только цель) усложняет игру, поражение —
+--- повтор текущего уровня.
 local function continue_after_over(self)
-	if self.over_kind == OVER_WIN then
+	if self.over_kind == OVER_WIN or self.over_kind == OVER_WIN_MAX then
 		advance_level(self)
 	else
 		restart(self)
@@ -1465,13 +1466,18 @@ restart = function(self)
 	start_round(self)
 end
 
---- Переход на следующий уровень после победы: поле больше на 2 клетки.
---- Достигнутый размер сохраняется на устройстве, чтобы прогресс не терялся.
+--- Переход на следующий уровень после победы: поле больше, а на максимальном
+--- поле растёт цель партии (+100 кубиков за круг).
+--- Достигнутый прогресс сохраняется на устройстве, чтобы не терялся.
 advance_level = function(self)
 	local next_size = game.next_field_size(game.FIELD_SIZE)
 	if next_size then
 		game.set_field_size(next_size)
-		progress.save_field_size(next_size)
+		progress.save_progress(next_size, 0)
+	else
+		-- Максимальное поле: усложняем количеством кубиков.
+		game.set_extra_rounds(game.next_extra_rounds())
+		progress.save_progress(game.FIELD_SIZE, game.EXTRA_ROUNDS)
 	end
 	start_round(self)
 end
@@ -1485,6 +1491,7 @@ function init(self)
 	else
 		game.set_field_size(game.MIN_FIELD_SIZE)
 	end
+	game.set_extra_rounds(progress.load_extra_rounds())
 
 	self.removed_cubes = 0
 	self.state = "play"
@@ -1572,9 +1579,10 @@ local function update_clear_anim(self, dt)
 			upload_board(self)
 		end
 
-		if self.removed_cubes >= game.TOTAL_CELLS then
-			-- Победа: если поле уже максимального размера, дальше усложнять
-			-- некуда — показываем соответствующую табличку.
+		if self.removed_cubes >= game.total_cells() then
+			-- Победа. На максимальном поле усложнять размером больше некуда,
+			-- поэтому победа там ведёт к новому кругу с увеличенной целью
+			-- (+100 кубиков), а не к тупиковой табличке.
 			local kind = OVER_WIN
 			if game.FIELD_SIZE >= game.MAX_FIELD_SIZE then
 				kind = OVER_WIN_MAX

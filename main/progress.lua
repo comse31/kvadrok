@@ -29,6 +29,9 @@ M.FILE = "kvadrok_progress"
 --- Ключ, под которым лежит уровень внутри файла.
 M.KEY = "field_size"
 
+--- Ключ, под которым лежит число пройденных кругов на максимальном поле.
+M.KEY_ROUNDS = "extra_rounds"
+
 --- Кэш абсолютного пути: sys.get_save_file() создаёт каталог, поэтому
 --- вызываем его один раз за запуск.
 local cached_path
@@ -99,6 +102,29 @@ function M.save_field_size(size)
 		return false
 	end
 	return M.save({ [M.KEY] = size })
+end
+
+--- Читает число пройденных дополнительных кругов на максимальном поле.
+--- Возвращает 0, если прогресса ещё нет.
+function M.load_extra_rounds()
+	local data = M.load()
+	local value = data[M.KEY_ROUNDS]
+	if type(value) == "number" and value > 0 then
+		return math.floor(value)
+	end
+	return 0
+end
+
+--- Записывает достигнутый размер поля и число пройденных кругов.
+function M.save_progress(size, extra_rounds)
+	if type(size) ~= "number" then
+		return false
+	end
+	extra_rounds = math.floor(tonumber(extra_rounds) or 0)
+	if extra_rounds < 0 then
+		extra_rounds = 0
+	end
+	return M.save({ [M.KEY] = size, [M.KEY_ROUNDS] = extra_rounds })
 end
 
 --- Полностью сбрасывает сохранённый прогресс.

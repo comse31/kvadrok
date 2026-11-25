@@ -49,6 +49,37 @@ M.H = M.FIELD_SIZE
 --- Сколько кубиков нужно разобрать за партию: S * S * 2 / 4, где S = FIELD_SIZE.
 M.TOTAL_CELLS = math.floor(M.FIELD_SIZE * M.FIELD_SIZE * 2 / 4)
 
+--- Насколько растёт цель партии за каждый пройденный круг на максимальном поле.
+M.EXTRA_CELLS_PER_ROUND = 100
+
+--- Сколько дополнительных кругов на максимальном поле уже пройдено.
+--- Влияет только на цель партии: поле остаётся максимального размера.
+M.EXTRA_ROUNDS = 0
+
+--- Цель партии для текущего поля с учётом пройденных кругов.
+--- Когда поле достигло максимального размера, дальше усложняем не размером,
+--- а количеством кубиков, которое нужно разобрать: +100 за каждый круг.
+function M.total_cells()
+	if M.FIELD_SIZE < M.MAX_FIELD_SIZE then
+		return M.TOTAL_CELLS
+	end
+	return M.TOTAL_CELLS + M.EXTRA_ROUNDS * M.EXTRA_CELLS_PER_ROUND
+end
+
+--- Задаёт число пройденных дополнительных кругов (при загрузке прогресса).
+function M.set_extra_rounds(rounds)
+	rounds = tonumber(rounds) or 0
+	if rounds < 0 then
+		rounds = 0
+	end
+	M.EXTRA_ROUNDS = math.floor(rounds)
+end
+
+--- Увеличивает сложность после победы на максимальном поле: +1 круг (+100 кубиков).
+function M.next_extra_rounds()
+	return M.EXTRA_ROUNDS + 1
+end
+
 --- Сторона стартового квадрата (зоны появления фигур) в клетках.
 M.ZONE = M.zone_for_size(M.FIELD_SIZE)
 
