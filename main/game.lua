@@ -1,5 +1,6 @@
 --- Игровая логика «Квадрок» (чистый Lua, без зависимостей от движка).
---- Поле по умолчанию 20x20 (размер задаётся настройкой M.FIELD_SIZE).
+--- Поле начинается с 20x20 и растёт на 2 клетки после каждой победы
+--- (20, 22, 24 … 30) через M.set_field_size().
 --- В центре поля находится квадрат 5x5, выделенный контуром:
 --- именно в нём появляются новые фигуры-тетромино.
 ---
@@ -16,8 +17,15 @@
 
 local M = {}
 
---- Настройка: сторона игрового поля в клетках (по умолчанию 20x20).
-M.FIELD_SIZE = 20
+--- Минимальный размер поля — стартовый уровень.
+M.MIN_FIELD_SIZE = 20
+--- Максимальный размер поля: дальше усложнять некуда.
+M.MAX_FIELD_SIZE = 30
+--- Шаг роста поля после победы (клетки).
+M.FIELD_STEP = 2
+
+--- Сторона игрового поля в клетках (текущий уровень).
+M.FIELD_SIZE = M.MIN_FIELD_SIZE
 
 M.W = M.FIELD_SIZE
 M.H = M.FIELD_SIZE
@@ -31,6 +39,43 @@ M.ZONE = 5
 --- Левый нижний угол зоны появления.
 M.ZONE_X = math.floor((M.W - M.ZONE) / 2)
 M.ZONE_Y = math.floor((M.H - M.ZONE) / 2)
+
+--- Приводит размер поля к допустимому уровню: 20, 22, … 30.
+function M.normalize_field_size(size)
+	size = tonumber(size) or M.MIN_FIELD_SIZE
+	size = math.floor(size)
+	size = size - (size - M.MIN_FIELD_SIZE) % M.FIELD_STEP
+	if size < M.MIN_FIELD_SIZE then
+		size = M.MIN_FIELD_SIZE
+	elseif size > M.MAX_FIELD_SIZE then
+		size = M.MAX_FIELD_SIZE
+	end
+	return size
+end
+
+--- Делает поле заданного размера. Все функции ниже читают M.W, M.H,
+--- M.ZONE_X, M.ZONE_Y и M.TOTAL_CELLS динамически, поэтому смена размера
+--- сразу применяется ко всей логике. Возвращает фактический размер.
+function M.set_field_size(size)
+	size = M.normalize_field_size(size)
+	M.FIELD_SIZE = size
+	M.W = size
+	M.H = size
+	M.TOTAL_CELLS = math.floor(size * size * 2 / 4)
+	M.ZONE_X = math.floor((M.W - M.ZONE) / 2)
+	M.ZONE_Y = math.floor((M.H - M.ZONE) / 2)
+	return size
+end
+
+--- Следующий размер поля после победы или nil, если достигнут максимум.
+--- Функция ничего не меняет: размер применяется через M.set_field_size().
+function M.next_field_size(size)
+	size = M.normalize_field_size(size)
+	if size >= M.MAX_FIELD_SIZE then
+		return nil
+	end
+	return size + M.FIELD_STEP
+end
 
 --- Радиус (в клетках), в пределах которого близость фигур влияет на цвет контура.
 M.DANGER_RADIUS = 7

@@ -1,10 +1,5 @@
 local game = require("main.game")
-
-local N = game.W
-local M = game.H
-local ZONE = game.ZONE
-local ZONE_X = game.ZONE_X
-local ZONE_Y = game.ZONE_Y
+local progress = require("main.progress")
 
 -- Отступы интерфейса — в долях от размера сцены, чтобы пропорции не зависели
 -- от разрешения и масштаба экрана.
@@ -22,9 +17,7 @@ local CELL_PX = 8
 local BASE_W = 420
 local BASE_H = 800
 
-local TEX_ID = "board_tx"
-local TEX_W = N * CELL_PX
-local TEX_H = M * CELL_PX
+local TEX_ID_PREFIX = "board_tx_"
 
 -- Контур центральной зоны — линия толщиной ровно 1 игровой пиксель, то есть
 -- 1 пиксель текстуры поля (1/8 клетки). Она лежит на пиксельной сетке текстуры
@@ -83,9 +76,16 @@ local COLOR_TEXT_DIM = vmath.vector4(0.60, 0.67, 0.80, 1.0)
 local HINT_PLAY = "Тащи деталь к краю или к фигуре"
 local HINT_DRAG_OK = "Отпусти — деталь останется"
 local HINT_DRAG_BAD = "Нет опоры — вернётся в центр"
-local HINT_GAMEOVER = "Тап — новая игра"
-local HINT_WIN = "Победа! Тап — новая игра"
 local HINT_CLEAR = "Ряд собран — кубики убраны"
+
+-- Таблички окончания партии. Заголовки разбиты на две строки, чтобы длинные
+-- фразы гарантированно помещались в плашку на узких экранах.
+local LOSE_TITLE = "Не беда,\nпопробуй снова"
+local LOSE_HINT = "Тап — сыграть ещё раз"
+local WIN_TITLE = "Получилось!\nНу тогда усложняем"
+local WIN_HINT = "Тап — следующее поле"
+local WIN_MAX_TITLE = "Получилось!\nЭто максимум"
+local WIN_MAX_HINT = "Тап — сыграть ещё раз"
 
 local function rgb_str(rgb)
 	return string.char(rgb[1], rgb[2], rgb[3])
@@ -176,6 +176,8 @@ end
 --- Собирает буфер текстуры по текущему состоянию поля.
 --- В логике ряд 0 — нижний, а строки текстуры идут сверху вниз, поэтому
 --- ряды перебираются в обратном порядке: иначе поле отрисовывается зеркально.
+--- Размер поля берётся из модуля логики (game.W/game.H), потому что он
+--- меняется при переходе на следующий уровень.
 local function build_buffer(self)
 	local rows = {}
 	-- Во время анимации сдвига поле рисуется в промежуточном состоянии:
@@ -183,10 +185,16 @@ local function build_buffer(self)
 	-- показывают отдельные узлы.
 	local board = self.board_render or self.board
 
+	local n = game.W
+	local m = game.H
+	local zone = game.ZONE
+	local zone_x = game.ZONE_X
+	local zone_y = game.ZONE_Y
+
 	local empty_block = BLOCKS.empty
 	local zone_block = BLOCKS.zone
 
-	for y = M - 1, 0, -1 do
+	for y = m - 1, 0, -1 do
 		local row = board[y]
 		-- Строки текстуры, соответствующие этому ряду клеток.
 		local buffers = {}
@@ -194,12 +202,12 @@ local function build_buffer(self)
 			buffers[i] = {}
 		end
 
-		for x = 0, N - 1 do
+		for x = 0, n - 1 do
 			local index = row[x]
 			local block
 			if index == 0 then
-				if x >= ZONE_X and x < ZONE_X + ZONE
-					and y >= ZONE_Y and y < ZONE_Y + ZONE then
+				if x >= zone_x and x < zone_x + zone
+					and y >= zone_y and y < zone_y + zone then
 					block = zone_block
 				else
 					block = empty_block
@@ -222,10 +230,10 @@ local function build_buffer(self)
 end
 
 local function upload_board(self)
-	if not self.board_node then
+	if not self.board_node or not self.tex_id then
 		return
 	end
-	local ok = gui.set_texture_data(TEX_ID, TEX_W, TEX_H, "rgb", build_buffer(self), false)
+	local ok = gui.set_texture_data(self.tex_id, self.tex_w, self.tex_h, "rgb", build_buffer(self), false)
 	if not ok then
 		print("Не удалось обновить текстуру поля")
 	end
@@ -289,7 +297,9 @@ local function relayout(self)
 		size = 64
 	end
 
-	self.cell = size / N
+	-- Сторона клетки зависит от текущего размера поля: при росте уровня
+	-- клетки становятся мельче, а поле занимает ту же площадь экрана.
+	self.cell = size / game.W
 	self.board_size = size
 	self.origin_x = (BASE_W - size) * 0.5
 	self.origin_y = margin_bottom + math.max(0, (avail_h - size) / 2)
@@ -304,26 +314,53 @@ local function relayout(self)
 	self.scene_h = BASE_H
 end
 
+--- Кэш текстур поля по размеру: при росте уровня у поля другая сторона
+--- в клетках, поэтому нужен отдельный буфер другой величины. Текстура для
+--- каждого размера создаётся один раз и переиспользуется.
+local TEXTURES = {}
+
+--- Возвращает идентификатор и размеры текстуры для поля текущего уровня,
+--- создавая её при первом обращении.
+local function board_texture()
+	local n = game.W
+	local m = game.H
+	local tex_w = n * CELL_PX
+	local tex_h = m * CELL_PX
+	local key = n .. "x" .. m
+
+	local entry = TEXTURES[key]
+	if not entry then
+		local id = TEX_ID_PREFIX .. n .. "x" .. m
+		local ok = gui.new_texture(id, tex_w, tex_h, "rgb", string.rep(string.char(0), tex_w * tex_h * 3))
+		if not ok then
+			print("Не удалось создать текстуру поля")
+			return nil
+		end
+		entry = { id = id, w = tex_w, h = tex_h }
+		TEXTURES[key] = entry
+	end
+	return entry
+end
+
 local function build_board_node(self)
 	if self.board_node then
 		gui.delete_node(self.board_node)
 	end
 
-	if not self.texture_ready then
-		local ok = gui.new_texture(TEX_ID, TEX_W, TEX_H, "rgb", string.rep(string.char(0), TEX_W * TEX_H * 3))
-		if not ok then
-			print("Не удалось создать текстуру поля")
-			return
-		end
-		self.texture_ready = true
+	local tex = board_texture()
+	if not tex then
+		return
 	end
+	self.tex_id = tex.id
+	self.tex_w = tex.w
+	self.tex_h = tex.h
 
 	self.board_node = make_box(
 		vmath.vector3(self.origin_x, self.origin_y, 0.05),
 		vmath.vector3(self.board_size, self.board_size, 0),
 		vmath.vector4(1, 1, 1, 1)
 	)
-	gui.set_texture(self.board_node, TEX_ID)
+	gui.set_texture(self.board_node, self.tex_id)
 end
 
 --- Удаляет узлы контура зоны.
@@ -346,9 +383,9 @@ local function build_frame(self)
 	clear_frame(self)
 
 	local gp = self.gp or (self.cell / CELL_PX)
-	local x = self.origin_x + ZONE_X * self.cell
-	local y = self.origin_y + ZONE_Y * self.cell
-	local w = ZONE * self.cell
+	local x = self.origin_x + game.ZONE_X * self.cell
+	local y = self.origin_y + game.ZONE_Y * self.cell
+	local w = game.ZONE * self.cell
 	local h = w
 	local color = danger_color(self.danger or 0)
 	local groups = {}
@@ -651,6 +688,10 @@ local function build_piece_nodes(self)
 	snap_piece_nodes(self)
 end
 
+-- Предварительное объявление: touch_xy() использует резервный путь через
+-- raw_touch_xy(), которая определена ниже.
+local raw_touch_xy
+
 --- Экранные координаты указателя (физические пиксели экрана).
 local function raw_screen_xy(action)
 	local entry = action.touch and action.touch[1]
@@ -760,6 +801,62 @@ local function set_hint(self, text)
 	gui.set_text(self.hint, text)
 end
 
+--- Удаляет табличку окончания партии.
+local function clear_overlay(self)
+	if self.overlay then
+		for i = 1, #self.overlay do
+			gui.delete_node(self.overlay[i])
+		end
+		self.overlay = nil
+	end
+end
+
+--- Рисует табличку окончания партии по центру поля: заголовок и подсказка
+--- поверх затемнённой плашки. Табличка не мешает полю — она полупрозрачная.
+local function build_overlay(self)
+	clear_overlay(self)
+
+	local info = self.overlay_info
+	if not info then
+		return
+	end
+
+	local w = self.scene_w
+	local cx = w * 0.5
+	local cy = self.origin_y + self.board_size * 0.5
+
+	local panel_w = w * 0.88
+	local panel_h = math.max(96, self.board_size * 0.30)
+	local font_scale = math.max(0.6, self.board_size / 420)
+
+	local nodes = {}
+	nodes[#nodes + 1] = make_box(
+		vmath.vector3(cx - panel_w * 0.5, cy - panel_h * 0.5, 0.7),
+		vmath.vector3(panel_w, panel_h, 0),
+		vmath.vector4(0.06, 0.09, 0.13, 0.94)
+	)
+
+	local title = make_label(
+		vmath.vector3(cx, cy + panel_h * 0.14, 0.72),
+		info.title,
+		gui.PIVOT_CENTER,
+		COLOR_TEXT
+	)
+	gui.set_scale(title, vmath.vector3(font_scale * 1.05, font_scale * 1.05, 1))
+	nodes[#nodes + 1] = title
+
+	local hint = make_label(
+		vmath.vector3(cx, cy - panel_h * 0.20, 0.72),
+		info.hint,
+		gui.PIVOT_CENTER,
+		COLOR_TEXT_DIM
+	)
+	gui.set_scale(hint, vmath.vector3(font_scale * 0.9, font_scale * 0.9, 1))
+	nodes[#nodes + 1] = hint
+
+	self.overlay = nodes
+end
+
 local function refresh(self)
 	if self.state ~= "gameover" then
 		self.danger_target = game.danger(self.board)
@@ -783,20 +880,58 @@ local function drop_supported(self)
 		and game.has_support(self.board, piece.cells, piece.x, piece.y)
 end
 
---- Завершает партию: показываем подсказку рестарта.
---- is_loss подсвечивает контур красным (зона появления заблокирована).
-local function game_over(self, hint_text, is_loss)
+--- Виды окончания партии.
+local OVER_LOSE = "lose"
+local OVER_WIN = "win"
+local OVER_WIN_MAX = "win_max"
+
+local OVERLAY_TEXT = {
+	[OVER_LOSE] = { title = LOSE_TITLE, hint = LOSE_HINT },
+	[OVER_WIN] = { title = WIN_TITLE, hint = WIN_HINT },
+	[OVER_WIN_MAX] = { title = WIN_MAX_TITLE, hint = WIN_MAX_HINT },
+}
+
+--- Завершает партию и показывает табличку.
+--- kind — OVER_LOSE, OVER_WIN или OVER_WIN_MAX; is_loss подсвечивает контур
+--- красным (зона появления заблокирована).
+local function game_over(self, kind, is_loss)
 	self.state = "gameover"
 	self.piece = nil
 	self.drag = nil
 	self.return_anim = nil
 	clear_piece_nodes(self)
+
+	-- Досрочно дорисовываем сдвиг кубиков, чтобы поле под табличкой было
+	-- в конечном состоянии.
+	if self.move_anim then
+		clear_move_nodes(self)
+		self.board_render = nil
+	end
+
 	if is_loss then
 		self.danger_target = 1
 		self.danger = 1
 	end
-	set_hint(self, hint_text or HINT_GAMEOVER)
+
+	local text = OVERLAY_TEXT[kind] or OVERLAY_TEXT[OVER_LOSE]
+	self.over_kind = kind
+	self.overlay_info = { title = text.title, hint = text.hint }
+	build_overlay(self)
+	set_hint(self, text.hint)
 	refresh(self)
+end
+
+-- Предварительные объявления: эти функции определяются ниже, но нужны здесь.
+local restart, advance_level
+
+--- Реакция на тап после окончания партии: победа ведёт на следующий уровень,
+--- поражение — на повтор текущего.
+local function continue_after_over(self)
+	if self.over_kind == OVER_WIN then
+		advance_level(self)
+	else
+		restart(self)
+	end
 end
 
 --- Появление новой фигуры в центре зоны.
@@ -805,13 +940,13 @@ local function spawn(self)
 	local x, y = game.spawn_pos(piece)
 
 	if not game.can_place(self.board, piece.cells, x, y) then
-		game_over(self, HINT_GAMEOVER, true)
+		game_over(self, OVER_LOSE, true)
 		return
 	end
 
 	-- Если деталь некуда поставить с опорой, партия исчерпана.
 	if not game.has_any_drop(self.board, piece) then
-		game_over(self, HINT_GAMEOVER, true)
+		game_over(self, OVER_LOSE, true)
 		return
 	end
 
@@ -895,7 +1030,10 @@ local function release_piece(self)
 	}
 end
 
-local function restart(self)
+--- Готовит чистое поле текущего уровня и запускает новую партию.
+--- Пересоздаёт узлы поля, контура и HUD, потому что при смене уровня
+--- меняется размер поля (и, значит, размер клетки, текстура и разметка).
+local function start_round(self)
 	self.board = game.new_board()
 	self.board_render = nil
 	self.removed_cubes = 0
@@ -906,16 +1044,48 @@ local function restart(self)
 	self.drag = nil
 	self.return_anim = nil
 	self.piece = nil
+	self.overlay_info = nil
 	clear_piece_nodes(self)
 	clear_fly_nodes(self)
 	clear_move_nodes(self)
-	-- Сразу возвращаем контуру зелёный цвет (он мог остаться красным).
+	clear_overlay(self)
+
+	-- Геометрия, текстура и разметка зависят от текущего размера поля.
+	relayout(self)
+	build_board_node(self)
+	build_hud(self)
+	build_frame(self)
 	update_frame(self)
 	update_hud(self)
 	spawn(self)
 end
 
+--- Рестарт: та же партия заново на текущем уровне.
+restart = function(self)
+	start_round(self)
+end
+
+--- Переход на следующий уровень после победы: поле больше на 2 клетки.
+--- Достигнутый размер сохраняется на устройстве, чтобы прогресс не терялся.
+advance_level = function(self)
+	local next_size = game.next_field_size(game.FIELD_SIZE)
+	if next_size then
+		game.set_field_size(next_size)
+		progress.save_field_size(next_size)
+	end
+	start_round(self)
+end
+
 function init(self)
+	-- Восстанавливаем прогресс с устройства: игра продолжается с того поля,
+	-- на котором игрок остановился в прошлый раз.
+	local saved = progress.load_field_size()
+	if saved then
+		game.set_field_size(saved)
+	else
+		game.set_field_size(game.MIN_FIELD_SIZE)
+	end
+
 	self.removed_cubes = 0
 	self.state = "play"
 	self.board = game.new_board()
@@ -925,6 +1095,7 @@ function init(self)
 	self.shown_removed = nil
 	self.drag = nil
 	self.return_anim = nil
+	self.overlay_info = nil
 
 	prepare_blocks()
 	prepare_piece_colors()
@@ -999,7 +1170,13 @@ local function update_clear_anim(self, dt)
 		end
 
 		if self.removed_cubes >= game.TOTAL_CELLS then
-			game_over(self, HINT_WIN, false)
+			-- Победа: если поле уже максимального размера, дальше усложнять
+			-- некуда — показываем соответствующую табличку.
+			local kind = OVER_WIN
+			if game.FIELD_SIZE >= game.MAX_FIELD_SIZE then
+				kind = OVER_WIN_MAX
+			end
+			game_over(self, kind, false)
 			return
 		end
 
@@ -1141,10 +1318,10 @@ function on_input(self, action_id, action)
 	end
 
 	-- Пока кубики убираются/сдвигаются или деталь летит в центр, ввод
-	-- игнорируем (кроме тапа после победы — его обрабатывает gameover).
+	-- игнорируем (кроме тапа после окончания партии — он продолжает игру).
 	if self.clear_anim or self.move_anim then
 		if self.state == "gameover" and action.pressed then
-			restart(self)
+			continue_after_over(self)
 		end
 		return true
 	end
@@ -1155,7 +1332,7 @@ function on_input(self, action_id, action)
 
 	if action.pressed then
 		if self.state == "gameover" then
-			restart(self)
+			continue_after_over(self)
 			return true
 		end
 		local piece = self.piece
@@ -1284,6 +1461,7 @@ function on_message(self, message_id, message, sender)
 		build_hud(self)
 		build_frame(self)
 		build_piece_nodes(self)
+		build_overlay(self)
 		refresh(self)
 	elseif message_id == hash("restart") then
 		restart(self)
