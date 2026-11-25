@@ -49,6 +49,16 @@ local MOVE_CUBE_DURATION = 0.2
 -- Высота подсветки верхней грани клетки детали (доля клетки).
 local PIECE_HI_R = 0.18
 
+-- При захвате палец полностью накрывает деталь, и её не видно. Поэтому деталь
+-- «выпрыгивает» вверх из-под пальца примерно на эту долю высоты сцены (но не
+-- меньше двух клеток). Подъём округляется до целых клеток, чтобы деталь
+-- оставалась на сетке поля: отпущенная деталь стоит ровно там, где её видит
+-- игрок.
+local DRAG_LIFT_R = 0.062
+local DRAG_LIFT_MIN_CELLS = 2
+-- Длительность «выпрыгивания» детали из-под пальца (секунды).
+local DRAG_LIFT_DURATION = 0.11
+
 -- Палитра клеток (RGB 0..255).
 local CELL_RGB = {
 	{ 61, 199, 240 },
@@ -460,16 +470,19 @@ local function clear_piece_nodes(self)
 end
 
 --- Ставит узлы детали в пиксельную позицию (левый нижний угол её bbox).
+--- jump_y — визуальный сдвиг «выпрыгивания» детали из-под пальца: он не
+--- влияет на игровую позицию и плавно уходит в ноль при захвате.
 local function position_piece_nodes(self, base_x, base_y)
 	if not self.piece_nodes then
 		return
 	end
 	local cell = self.cell
 	local hi_h = math.max(1, cell * PIECE_HI_R)
+	local jump = self.jump_y or 0
 	for i = 1, #self.piece_nodes do
 		local n = self.piece_nodes[i]
 		local x = base_x + n.cx * cell
-		local y = base_y + n.cy * cell
+		local y = base_y + n.cy * cell + jump
 		gui.set_position(n.fill, vmath.vector3(x, y, 0.5))
 		gui.set_position(n.hi, vmath.vector3(x, y + cell - hi_h, 0.52))
 	end
@@ -899,6 +912,9 @@ local function game_over(self, kind, is_loss)
 	self.piece = nil
 	self.drag = nil
 	self.return_anim = nil
+	self.jump_y = nil
+	self.jump_from = nil
+	self.jump_t = nil
 	clear_piece_nodes(self)
 
 	-- Досрочно дорисовываем сдвиг кубиков, чтобы поле под табличкой было
@@ -955,6 +971,9 @@ local function spawn(self)
 	self.piece = piece
 	self.drag = nil
 	self.return_anim = nil
+	self.jump_y = nil
+	self.jump_from = nil
+	self.jump_t = nil
 	build_piece_nodes(self)
 	-- В центре у детали ещё нет опоры, но приглушение включается только
 	-- во время перетаскивания, поэтому подсвечиваем её обычным цветом.
@@ -970,6 +989,14 @@ local function release_piece(self)
 	if not piece then
 		return
 	end
+
+	-- Незавершённое «выпрыгивание»: запоминаем визуальный сдвиг. Логическая
+	-- позиция детали уже поднята, поэтому при возврате в центр стартуем с
+	-- фактического положения узлов — без дёрганья в момент отпускания.
+	local jump = self.jump_y or 0
+	self.jump_y = nil
+	self.jump_from = nil
+	self.jump_t = nil
 
 	if drop_supported(self) then
 		game.place(self.board, piece.cells, piece.x, piece.y, piece.color)
@@ -1002,7 +1029,7 @@ local function release_piece(self)
 	-- Возврат в центр: плавно, но целевая позиция — клетки зоны появления.
 	local sx, sy = game.spawn_pos(piece)
 	local from_x = self.origin_x + piece.x * self.cell
-	local from_y = self.origin_y + piece.y * self.cell
+	local from_y = self.origin_y + piece.y * self.cell + jump
 	local to_x = self.origin_x + sx * self.cell
 	local to_y = self.origin_y + sy * self.cell
 
@@ -1045,6 +1072,9 @@ local function start_round(self)
 	self.return_anim = nil
 	self.piece = nil
 	self.overlay_info = nil
+	self.jump_y = nil
+	self.jump_from = nil
+	self.jump_t = nil
 	clear_piece_nodes(self)
 	clear_fly_nodes(self)
 	clear_move_nodes(self)
@@ -1096,6 +1126,9 @@ function init(self)
 	self.drag = nil
 	self.return_anim = nil
 	self.overlay_info = nil
+	self.jump_y = nil
+	self.jump_from = nil
+	self.jump_t = nil
 
 	prepare_blocks()
 	prepare_piece_colors()
@@ -1229,6 +1262,24 @@ function update(self, dt)
 	end
 	if self.move_anim then
 		update_move_anim(self, dt)
+	end
+
+	-- «Выпрыгивание» детали из-под пальца при захвате: визуальный сдвиг
+	-- плавно уходит в ноль, при этом логическая позиция уже поднята.
+	if self.jump_t then
+		self.jump_t = self.jump_t + dt
+		local k = self.jump_t / DRAG_LIFT_DURATION
+		if k > 1 then
+			k = 1
+		end
+		local e = 1 - (1 - k) * (1 - k) * (1 - k)
+		self.jump_y = lerp(self.jump_from, 0, e)
+		if k >= 1 then
+			self.jump_t = nil
+			self.jump_from = nil
+			self.jump_y = nil
+		end
+		snap_piece_nodes(self)
 	end
 
 	-- Анимация возврата детали в центр зоны.
@@ -1373,6 +1424,40 @@ function on_input(self, action_id, action)
 			off_y = piece.h
 		end
 
+		-- При захвате палец накрывает деталь целиком, и её не видно. Деталь
+		-- поднимается вверх из-под пальца, а смещение захвата уменьшается на
+		-- ту же величину: дальше деталь следует за пальцем с постоянным
+		-- вертикальным отступом. Подъём считается в целых клетках, поэтому
+		-- деталь остаётся на сетке поля и после отпускания стоит ровно там,
+		-- где игрок её видит.
+		local lift = math.max(
+			DRAG_LIFT_MIN_CELLS,
+			math.ceil(BASE_H * DRAG_LIFT_R / self.cell)
+		)
+		local max_lift = game.H - piece.h - piece.y
+		if lift > max_lift then
+			lift = max_lift
+		end
+		if lift < 0 then
+			lift = 0
+		end
+		-- Не поднимаем деталь на занятые клетки: иначе она бы накрыла уже
+		-- поставленные кубики, и отпускание выглядело бы обманом.
+		while lift > 0 and not game.can_place(self.board, piece.cells, piece.x, piece.y + lift) do
+			lift = lift - 1
+		end
+
+		if lift > 0 then
+			piece.y = piece.y + lift
+			off_y = off_y - lift
+			-- Визуальный «прыжок»: узлы стартуют в старой позиции (под пальцем)
+			-- и плавно догоняют уже поднятую логическую позицию детали.
+			self.jump_from = -lift * self.cell
+			self.jump_y = self.jump_from
+			self.jump_t = 0
+			snap_piece_nodes(self)
+		end
+
 		self.drag = {
 			id = touch_id(action),
 			off_x = off_x,
@@ -1399,6 +1484,19 @@ function on_input(self, action_id, action)
 		self.drag = nil
 		release_piece(self)
 		return true
+	end
+
+	-- Как только палец пошёл, «прыжок» больше не нужен: логическая позиция
+	-- детали уже поднята, а визуальный сдвиг только смазывал бы движение.
+	-- Сбрасываем его мгновенно, чтобы при отпускании деталь стояла ровно
+	-- там, где её видит игрок.
+	if self.jump_t then
+		self.jump_t = nil
+		self.jump_from = nil
+		self.jump_y = nil
+		if self.piece then
+			snap_piece_nodes(self)
+		end
 	end
 
 	-- Defold присылает экшен каждый кадр, пока палец на экране: отдельного
@@ -1462,6 +1560,11 @@ function on_message(self, message_id, message, sender)
 				return
 			end
 		end
+
+		-- Ресайз во время «выпрыгивания»: сдвиг обнуляем, позиция уже поднята.
+		self.jump_t = nil
+		self.jump_from = nil
+		self.jump_y = nil
 
 		-- Ресайз во время возврата: сразу доводим деталь до центра,
 		-- чтобы пиксельные координаты анимации не разъехались с новой сеткой.
