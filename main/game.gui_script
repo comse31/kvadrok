@@ -450,13 +450,30 @@ local function lerp(a, b, t)
 	return a + (b - a) * t
 end
 
---- Цвет контура для значения опасности 0..1.
-local function danger_color(value)
+--- Цвет контура для доли заполнения поля 0..1:
+--- до 50% — между зелёным и жёлтым, но ближе к зелёному;
+--- 50–80% — между зелёным и жёлтым, но ближе к жёлтому;
+--- выше 80% — от жёлтого к красному.
+local FILL_HALF = 0.5
+local FILL_YELLOW_MAX = 0.8
+
+local function frame_color(value)
 	local from, to, t
-	if value < 0.5 then
-		from, to, t = COLOR_OK, COLOR_WARN, value / 0.5
+	if value < FILL_YELLOW_MAX then
+		-- Зелёный -> жёлтый, но с опорной точкой на 50%: там смешение ровно
+		-- посередине. Значит до 50% цвет ближе к зелёному, а на 50–80% —
+		-- ближе к жёлтому (к 80% доходит до чистого жёлтого).
+		local k
+		if value < FILL_HALF then
+			k = 0.5 * (value / FILL_HALF)
+		else
+			k = 0.5 + 0.5 * ((value - FILL_HALF) / (FILL_YELLOW_MAX - FILL_HALF))
+		end
+		from, to, t = COLOR_OK, COLOR_WARN, k
 	else
-		from, to, t = COLOR_WARN, COLOR_BAD, (value - 0.5) / 0.5
+		-- Жёлтый -> красный на последних 20% заполнения.
+		from, to, t = COLOR_WARN, COLOR_BAD,
+			(value - FILL_YELLOW_MAX) / (1 - FILL_YELLOW_MAX)
 	end
 	return vmath.vector4(
 		lerp(from[1], to[1], t) / 255,
@@ -575,7 +592,7 @@ local function build_frame(self)
 	local y = self.origin_y + game.ZONE_Y * self.cell
 	local w = game.ZONE * self.cell
 	local h = w
-	local color = danger_color(self.danger or 0)
+	local color = frame_color(self.fill or 0)
 	local groups = {}
 
 	-- Ореолы: кольца снаружи зоны, от внешнего к внутреннему.
@@ -620,12 +637,12 @@ local function build_frame(self)
 	self.frame = groups
 end
 
---- Перекрашивает контур зоны под текущее значение опасности.
+--- Перекрашивает контур зоны под текущую долю заполнения поля.
 local function update_frame(self)
 	if not self.frame then
 		return
 	end
-	local color = danger_color(self.danger or 0)
+	local color = frame_color(self.fill or 0)
 	for i = 1, #self.frame do
 		local group = self.frame[i]
 		local c = vmath.vector4(color.x, color.y, color.z, group.alpha)
@@ -1159,7 +1176,7 @@ end
 
 local function refresh(self)
 	if self.state ~= "gameover" then
-		self.danger_target = game.danger(self.board)
+		self.fill_target = game.fill_ratio(self.board)
 	end
 	upload_board(self)
 	-- Перекрашиваем контур сразу, чтобы после рестарта и ресайза цвет
@@ -1215,8 +1232,9 @@ local function game_over(self, kind, is_loss)
 	end
 
 	if is_loss then
-		self.danger_target = 1
-		self.danger = 1
+		-- Поражение — зона появления заблокирована, контур красный.
+		self.fill_target = 1
+		self.fill = 1
 	end
 
 	local text = OVERLAY_TEXT[kind] or OVERLAY_TEXT[OVER_LOSE]
@@ -1409,8 +1427,8 @@ local function start_round(self)
 	self.board = game.new_board()
 	self.board_render = nil
 	self.removed_cubes = 0
-	self.danger = 0
-	self.danger_target = 0
+	self.fill = 0
+	self.fill_target = 0
 	self.shown_removed = nil
 	self.state = "play"
 	self.drag = nil
@@ -1472,8 +1490,8 @@ function init(self)
 	self.state = "play"
 	self.board = game.new_board()
 	self.board_render = nil
-	self.danger = 0
-	self.danger_target = 0
+	self.fill = 0
+	self.fill_target = 0
 	self.shown_removed = nil
 	self.drag = nil
 	self.return_anim = nil
@@ -1664,19 +1682,18 @@ function update(self, dt)
 		end
 	end
 
-	local target = self.danger_target or 0
+	local target = self.fill_target or 0
 
 	-- Плавное приближение к целевому значению.
 	local step = math.min(1, dt * 3)
-	local next_value = self.danger + (target - self.danger) * step
-	if math.abs(next_value - self.danger) < 0.0005 then
+	local next_value = self.fill + (target - self.fill) * step
+	if math.abs(next_value - self.fill) < 0.0005 then
 		next_value = target
 	end
 
-	if next_value ~= self.danger then
-		self.danger = next_value
+	if next_value ~= self.fill then
+		self.fill = next_value
 		update_frame(self)
-		update_hud(self)
 	end
 end
 

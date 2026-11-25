@@ -13,9 +13,9 @@
 ---
 --- Зона появления должна оставаться свободной: ставить фигуру поверх неё
 --- нельзя, а если новая фигура не помещается в центре — партия заканчивается.
----
---- Функция M.danger() показывает, насколько плотно фигуры подступили
---- к контуру: 0 — вокруг пусто, 1 — фигуры вплотную.
+--- Функция M.fill_ratio() показывает, насколько заполнено игровое поле:
+--- 0 — поле пустое, 1 — заполнено целиком. По ней окрашивается контур
+--- стартового квадрата: зелёный -> жёлтый -> красный.
 
 local M = {}
 
@@ -105,12 +105,6 @@ function M.next_field_size(size)
 	end
 	return nil
 end
-
---- Радиус (в клетках), в пределах которого близость фигур влияет на цвет контура.
-M.DANGER_RADIUS = 7
-
---- Сумма весов близости, при которой контур считается полностью красным.
-M.DANGER_SATURATION = 10
 
 --- Считать ли касание углом (по диагонали) опорой для фигуры.
 M.TOUCH_DIAGONAL = false
@@ -354,53 +348,7 @@ function M.clamp_pos(piece, px, py)
 	return px, py
 end
 
---- Расстояние Чебышёва от клетки до прямоугольника зоны (0 — внутри).
-local function zone_distance(x, y)
-	local dx = 0
-	if x < M.ZONE_X then
-		dx = M.ZONE_X - x
-	elseif x > M.ZONE_X + M.ZONE - 1 then
-		dx = x - (M.ZONE_X + M.ZONE - 1)
-	end
-
-	local dy = 0
-	if y < M.ZONE_Y then
-		dy = M.ZONE_Y - y
-	elseif y > M.ZONE_Y + M.ZONE - 1 then
-		dy = y - (M.ZONE_Y + M.ZONE - 1)
-	end
-
-	return math.max(dx, dy)
-end
-
---- Насколько близко зафиксированные фигуры подступили к контуру: 0..1.
-function M.danger(board)
-	local radius = M.DANGER_RADIUS
-	local sum = 0
-
-	for y = 0, M.H - 1 do
-		local row = board[y]
-		for x = 0, M.W - 1 do
-			if row[x] ~= 0 then
-				local d = zone_distance(x, y)
-				if d <= 1 then
-					sum = sum + 1
-				elseif d <= radius then
-					sum = sum + (radius - d + 1) / radius
-				end
-			end
-		end
-	end
-
-	local value = sum / M.DANGER_SATURATION
-	if value < 0 then
-		return 0
-	elseif value > 1 then
-		return 1
-	end
-	return value
-end
-
+--- Ставит клетки фигуры на поле и возвращает список занятых клеток.
 function M.place(board, cells, px, py, color)
 	local placed = {}
 	for i = 1, #cells do
@@ -631,6 +579,23 @@ function M.occupied(board)
 		end
 	end
 	return n
+end
+
+--- Доля заполнения игрового поля: 0 — поле пустое, 1 — заполнено целиком.
+--- Именно по этому значению окрашивается контур стартового квадрата:
+--- до 50% — ближе к зелёному, 50–80% — ближе к жёлтому, выше — к красному.
+function M.fill_ratio(board)
+	local total = M.W * M.H
+	if total <= 0 then
+		return 0
+	end
+	local ratio = M.occupied(board) / total
+	if ratio < 0 then
+		return 0
+	elseif ratio > 1 then
+		return 1
+	end
+	return ratio
 end
 
 return M
