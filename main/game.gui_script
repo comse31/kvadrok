@@ -71,12 +71,17 @@ local DRAG_LIFT_MIN_CELLS = 2
 -- жёлтый или красный) каждые BONUS_INTERVAL ходов в случайной заполненной
 -- ячейке появляется золотой или серебряный кубик. Он переливается и блестит
 -- и остаётся призовым навсегда: пропадает только вместе с собранной линией,
--- одновременно запуская призовой эффект — следующая фигура начинает
--- вращаться, пока игрок её не захватит.
+-- одновременно запуская призовой эффект — следующая фигура каждые
+-- BONUS_SPIN_STEP_DELAY секунд поворачивается на 90°, пока игрок её не захватит.
 local BONUS_INTERVAL = 4
+-- Одновременно на поле может быть не больше BONUS_MAX призовых кубиков.
+local BONUS_MAX = 5
 -- Жёлтая фаза начинается с 30% заполнения — с этого момента появляются бонусы.
 local BONUS_FILL_MIN = 0.3
-local BONUS_SPIN_RATE = 3
+-- Призовой эффект: фигура не крутится непрерывно, а меняет положение
+-- ступенчато — на 90° раз в полсекунды.
+local BONUS_SPIN_STEP_DELAY = 0.5
+local BONUS_SPIN_STEP = math.pi * 0.5
 local BONUS_GOLD = { 255, 201, 64 }
 local BONUS_SILVER = { 226, 233, 244 }
 
@@ -1133,8 +1138,13 @@ local function apply_bonus_clear(self, cleared, moves)
 	end
 end
 
---- Добавляет призовой кубик в случайную заполненную клетку.
+--- Добавляет призовой кубик в случайную заполненную клетку. Если на поле уже
+--- BONUS_MAX призовых кубиков, новый не появляется.
 local function start_bonus(self)
+	if self.bonuses and #self.bonuses >= BONUS_MAX then
+		return
+	end
+
 	local candidates = {}
 	for y = 0, game.H - 1 do
 		local row = self.board[y]
@@ -1220,9 +1230,9 @@ local function update_bonus_fly(self, dt)
 	end
 end
 
---- Включает вращение текущей фигуры (3 оборота в секунду).
+--- Включает ступенчатый поворот текущей фигуры: на 90° каждые полсекунды.
 local function start_spin(self)
-	self.spin = { angle = 0 }
+	self.spin = { angle = 0, t = 0 }
 end
 
 --- Останавливает вращение и возвращает узлы детали в обычное положение.
@@ -1246,7 +1256,8 @@ local function stop_spin(self)
 	end
 end
 
---- Вращает узлы детали вокруг её геометрического центра. Вращаются только
+--- Поворачивает узлы детали вокруг её геометрического центра ступенчато:
+--- раз в BONUS_SPIN_STEP_DELAY секунд угол меняется на 90°. Вращаются только
 --- кубики и их подсветка; сама клеточная позиция и логика не меняются.
 local function update_piece_spin(self, dt)
 	local spin = self.spin
@@ -1255,7 +1266,11 @@ local function update_piece_spin(self, dt)
 		return
 	end
 
-	spin.angle = (spin.angle + dt * BONUS_SPIN_RATE * math.pi * 2) % (math.pi * 2)
+	spin.t = (spin.t or 0) + dt
+	while spin.t >= BONUS_SPIN_STEP_DELAY do
+		spin.t = spin.t - BONUS_SPIN_STEP_DELAY
+		spin.angle = (spin.angle + BONUS_SPIN_STEP) % (math.pi * 2)
+	end
 	local ang = spin.angle
 	local c, s = math.cos(ang), math.sin(ang)
 	local cell = self.cell
