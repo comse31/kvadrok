@@ -32,6 +32,9 @@ M.KEY = "field_size"
 --- Ключ, под которым лежит число пройденных кругов на максимальном поле.
 M.KEY_ROUNDS = "extra_rounds"
 
+--- Ключ, под которым лежит выбранная тема оформления ("dark" или "light").
+M.KEY_THEME = "theme"
+
 --- Кэш абсолютного пути: sys.get_save_file() создаёт каталог, поэтому
 --- вызываем его один раз за запуск.
 local cached_path
@@ -124,7 +127,32 @@ function M.save_progress(size, extra_rounds)
 	if extra_rounds < 0 then
 		extra_rounds = 0
 	end
-	return M.save({ [M.KEY] = size, [M.KEY_ROUNDS] = extra_rounds })
+	local data = M.load()
+	data[M.KEY] = size
+	data[M.KEY_ROUNDS] = extra_rounds
+	return M.save(data)
+end
+
+--- Читает сохранённую тему оформления ("dark" или "light").
+--- Если тема ещё не выбиралась, возвращает nil — вызывающий код подставит
+--- тему по умолчанию.
+function M.load_theme()
+	local data = M.load()
+	local value = data[M.KEY_THEME]
+	if value == "light" or value == "dark" then
+		return value
+	end
+	return nil
+end
+
+--- Записывает выбранную тему оформления, сохраняя остальной прогресс.
+function M.save_theme(theme)
+	if theme ~= "light" and theme ~= "dark" then
+		return false
+	end
+	local data = M.load()
+	data[M.KEY_THEME] = theme
+	return M.save(data)
 end
 
 --- Полностью сбрасывает сохранённый прогресс.

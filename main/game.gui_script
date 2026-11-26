@@ -49,27 +49,9 @@ local MOVE_CUBE_DURATION = 0.2
 -- Высота подсветки верхней грани клетки детали (доля клетки).
 local PIECE_HI_R = 0.18
 
--- Мягкая подсветка рядов и столбцов, в которых находится перетаскиваемая
--- деталь. Свет вписывается прямо в пиксели текстуры поля, поэтому ложится
--- ровно по сетке и при растяжении текстуры сглаживается фильтрацией.
--- Подсвечивается не каждая клетка по отдельности, а весь непрерывный
--- диапазон: у его границ свет плавно сходит на нет, к середине набирает
--- полную силу. Так группа соседних клеток читается как одна мягкая полоса,
--- без внутренних швов.
--- Цвет заметно голубой (а не белёсый), чтобы подсветка читалась как свет,
--- а не как осветлённый фон поля.
-local HIGHLIGHT_RGB = { 108, 186, 255 }
--- Максимальная сила света в середине полосы. Небольшая: подсветка должна
--- быть деликатной и не мешать видеть кубики на поле. Свет включается не
--- только альфой, но и небольшой прибавкой к яркости — так он читается как
--- голубоватый ореол, а не как выбеленная полоса.
-local HIGHLIGHT_ALPHA = 0.20
--- Насколько свет осветляет клетку под собой (0..1). Небольшое значение
--- сохраняет исходный цвет фона и кубиков.
-local HIGHLIGHT_LIGHTEN = 0.28
--- Ширина плавного края полосы (в клетках). Существенно больше клетки, поэтому
--- свет почти не выходит на максимум даже в узкой детали: получается размытое
--- голубоватое свечение с очень плавными краями, без «ядра» и видимых границ.
+-- Ширина плавного края полосы подсветки (в клетках). Существенно больше
+-- клетки, поэтому свет почти не выходит на максимум даже в узкой детали:
+-- получается размытое свечение с очень плавными краями, без видимых границ.
 local HIGHLIGHT_RAMP = 2.4
 
 -- Короткая анимация «прилипания» детали к клетке при отпускании. Деталь
@@ -85,29 +67,68 @@ local LAND_DURATION = 0.07
 local DRAG_LIFT_R = 0.062
 local DRAG_LIFT_MIN_CELLS = 2
 
--- Палитра клеток (RGB 0..255).
-local CELL_RGB = {
-	{ 61, 199, 240 },
-	{ 250, 209, 69 },
-	{ 184, 117, 242 },
-	{ 92, 219, 133 },
-	{ 245, 112, 112 },
-	{ 97, 148, 250 },
-	{ 250, 158, 71 },
+-- Палитры оформления. Переключение темы меняет фон приложения (clear_color),
+-- цвета поля, фигур, текста, плашек и кнопки переключения. Цвета фигур заданы
+-- в RGB 0..255 — из них собираются пиксели текстуры поля и цвета узлов детали.
+-- В светлой теме фон приложения светлый, шрифты тёмные, а фигуры насыщеннее и
+-- ярче, чтобы читаться на белом поле.
+local THEMES = {
+	dark = {
+		bg = vmath.vector4(0.043, 0.059, 0.086, 1),
+		empty = { 21, 27, 39 },
+		zone = { 28, 36, 52 },
+		cells = {
+			{ 61, 199, 240 },
+			{ 250, 209, 69 },
+			{ 184, 117, 242 },
+			{ 92, 219, 133 },
+			{ 245, 112, 112 },
+			{ 97, 148, 250 },
+			{ 250, 158, 71 },
+		},
+		text = vmath.vector4(0.92, 0.95, 1.0, 1.0),
+		text_dim = vmath.vector4(0.60, 0.67, 0.80, 1.0),
+		panel = vmath.vector4(0.06, 0.09, 0.13, 0.94),
+		button_bg = vmath.vector4(0.16, 0.21, 0.30, 0.96),
+		button_border = vmath.vector4(0.42, 0.50, 0.64, 0.90),
+		highlight_rgb = { 108, 186, 255 },
+		highlight_alpha = 0.20,
+		highlight_lighten = 0.28,
+		-- Подпись кнопки показывает тему, на которую переключит нажатие.
+		toggle_label = "Светлая тема",
+	},
+	light = {
+		bg = vmath.vector4(0.91, 0.93, 0.96, 1),
+		empty = { 255, 255, 255 },
+		zone = { 214, 227, 247 },
+		cells = {
+			{ 0, 168, 232 },
+			{ 255, 186, 0 },
+			{ 147, 72, 236 },
+			{ 42, 196, 110 },
+			{ 240, 72, 72 },
+			{ 45, 110, 235 },
+			{ 250, 138, 25 },
+		},
+		text = vmath.vector4(0.10, 0.13, 0.20, 1.0),
+		text_dim = vmath.vector4(0.36, 0.42, 0.54, 1.0),
+		panel = vmath.vector4(1.0, 1.0, 1.0, 0.97),
+		button_bg = vmath.vector4(0.84, 0.88, 0.95, 1.0),
+		button_border = vmath.vector4(0.30, 0.40, 0.58, 0.95),
+		highlight_rgb = { 70, 140, 255 },
+		highlight_alpha = 0.32,
+		highlight_lighten = 0.0,
+		toggle_label = "Темная тема",
+	},
 }
 
--- Цвет фона поля и пустых клеток (сетка не рисуется).
-local RGB_EMPTY = { 21, 27, 39 }
--- Чуть более светлый фон клеток внутри зоны появления.
-local RGB_ZONE = { 28, 36, 52 }
+-- Текущая тема оформления. Переключается apply_theme(); по умолчанию тёмная.
+local THEME = THEMES.dark
 
--- Цвета контура: зелёный -> жёлтый -> красный.
+-- Цвета контура: зелёный -> жёлтый -> красный (общие для обеих тем).
 local COLOR_OK = { 62, 226, 124 }
 local COLOR_WARN = { 246, 212, 66 }
 local COLOR_BAD = { 246, 62, 62 }
-
-local COLOR_TEXT = vmath.vector4(0.92, 0.95, 1.0, 1.0)
-local COLOR_TEXT_DIM = vmath.vector4(0.60, 0.67, 0.80, 1.0)
 
 local HINT_PLAY = "Тащи деталь к краю или к фигуре"
 local HINT_DRAG_OK = "Отпусти — деталь останется"
@@ -170,10 +191,13 @@ local function block_for(key, rgb)
 end
 
 local function prepare_blocks()
-	BLOCKS.empty = make_flat_block(RGB_EMPTY)
-	BLOCKS.zone = make_flat_block(RGB_ZONE)
-	for i = 1, #CELL_RGB do
-		block_for("c" .. i, CELL_RGB[i])
+	-- Блоки пересобираются под текущую тему: фон, зона появления и клетки
+	-- фигур берут цвета из THEME, поэтому при переключении темы кэш сбрасывается.
+	BLOCKS = {}
+	BLOCKS.empty = make_flat_block(THEME.empty)
+	BLOCKS.zone = make_flat_block(THEME.zone)
+	for i = 1, #THEME.cells do
+		block_for("c" .. i, THEME.cells[i])
 	end
 end
 
@@ -197,9 +221,9 @@ local function band_alpha(p, a, b)
 	local ramp = math.min(HIGHLIGHT_RAMP, (b - a) * 0.75)
 	local t = d / ramp
 	if t >= 1 then
-		return HIGHLIGHT_ALPHA
+		return THEME.highlight_alpha
 	end
-	return HIGHLIGHT_ALPHA * t * t * (3 - 2 * t)
+	return THEME.highlight_alpha * t * t * (3 - 2 * t)
 end
 
 -- Кэш прозрачности по пикселям для конкретной клетки диапазона.
@@ -251,7 +275,8 @@ local function blend_block(key, ca, ra)
 	end
 
 	local base = BLOCKS[key] or BLOCKS.empty
-	local cr, cg, cb = HIGHLIGHT_RGB[1], HIGHLIGHT_RGB[2], HIGHLIGHT_RGB[3]
+	local highlight = THEME.highlight_rgb
+	local cr, cg, cb = highlight[1], highlight[2], highlight[3]
 	local rows = {}
 	for r = 0, CELL_PX - 1 do
 		local src = base[r + 1]
@@ -267,7 +292,7 @@ local function blend_block(key, ca, ra)
 			if a > 0 then
 				-- Подмешиваем голубой оттенок и одновременно слегка поднимаем
 				-- яркость: свет читается как мягкое свечение, а не как плёнка.
-				local k = a * (1 + HIGHLIGHT_LIGHTEN)
+				local k = a * (1 + THEME.highlight_lighten)
 				br = br + (cr - br) * a + br * (k - a)
 				bg = bg + (cg - bg) * a + bg * (k - a)
 				bb = bb + (cb - bb) * a + bb * (k - a)
@@ -308,8 +333,12 @@ local function prepare_piece_colors()
 	local function vec(r, g, b)
 		return vmath.vector4(r / 255, g / 255, b / 255, 1)
 	end
-	for i = 1, #CELL_RGB do
-		local rgb = CELL_RGB[i]
+	-- Цвета фигур берутся из текущей темы: в светлой теме они насыщеннее и
+	-- ярче, а приглушённый вариант смешивается со светлым фоном поля.
+	local cells = THEME.cells
+	local empty = THEME.empty
+	for i = 1, #cells do
+		local rgb = cells[i]
 		PIECE_FILL[i] = vec(rgb[1], rgb[2], rgb[3])
 		PIECE_HI[i] = vec(
 			math.min(255, rgb[1] * 1.18),
@@ -318,9 +347,9 @@ local function prepare_piece_colors()
 		)
 		-- Приглушённый вариант: смешиваем с фоном поля.
 		local f = 0.45
-		local dr = rgb[1] * f + RGB_EMPTY[1] * (1 - f)
-		local dg = rgb[2] * f + RGB_EMPTY[2] * (1 - f)
-		local db = rgb[3] * f + RGB_EMPTY[3] * (1 - f)
+		local dr = rgb[1] * f + empty[1] * (1 - f)
+		local dg = rgb[2] * f + empty[2] * (1 - f)
+		local db = rgb[3] * f + empty[3] * (1 - f)
 		PIECE_FILL_DIM[i] = vec(dr, dg, db)
 		PIECE_HI_DIM[i] = vec(
 			math.min(255, dr * 1.18),
@@ -442,7 +471,7 @@ local function make_label(pos, text, pivot, color)
 	gui.set_font(node, "main")
 	gui.set_pivot(node, pivot)
 	gui.set_adjust_mode(node, gui.ADJUST_FIT)
-	gui.set_color(node, color or COLOR_TEXT)
+	gui.set_color(node, color or THEME.text)
 	return node
 end
 
@@ -1064,6 +1093,85 @@ local function update_hud(self)
 	gui.set_text(self.status, "Разобрано " .. tostring(removed) .. " " .. cubes_word(removed))
 end
 
+-- Кнопка переключения темы в правом верхнем углу сцены (эталонные единицы).
+local THEME_BTN_W = 118
+local THEME_BTN_H = 34
+local THEME_BTN_MARGIN_R = 0.035 -- доля ширины сцены
+local THEME_BTN_MARGIN_T = 0.022 -- доля высоты сцены
+local THEME_BTN_FONT = 0.66
+
+--- Удаляет узлы кнопки переключения темы.
+local function clear_theme_button(self)
+	if self.theme_btn then
+		for i = 1, #self.theme_btn.nodes do
+			gui.delete_node(self.theme_btn.nodes[i])
+		end
+		self.theme_btn = nil
+	end
+end
+
+--- Рисует кнопку переключения темы. Подпись сообщает, на какую тему
+--- переключит нажатие. Прямоугольник кнопки запоминается в координатах сцены,
+--- чтобы on_input мог проверить попадание тапа.
+local function build_theme_button(self)
+	clear_theme_button(self)
+
+	local w = self.scene_w
+	local h = self.scene_h
+	local right = w - w * THEME_BTN_MARGIN_R
+	local top = h - h * THEME_BTN_MARGIN_T
+	local left = right - THEME_BTN_W
+	local bottom = top - THEME_BTN_H
+
+	local nodes = {}
+	nodes[#nodes + 1] = make_box(
+		vmath.vector3(left, bottom, 0.12),
+		vmath.vector3(THEME_BTN_W, THEME_BTN_H, 0),
+		THEME.button_bg
+	)
+
+	-- Тонкая рамка из четырёх полос: отделяет кнопку от поля в обеих темах.
+	local border = THEME.button_border
+	local bt = 1
+	nodes[#nodes + 1] = make_box(
+		vmath.vector3(left, bottom, 0.125),
+		vmath.vector3(THEME_BTN_W, bt, 0),
+		border
+	)
+	nodes[#nodes + 1] = make_box(
+		vmath.vector3(left, top - bt, 0.125),
+		vmath.vector3(THEME_BTN_W, bt, 0),
+		border
+	)
+	nodes[#nodes + 1] = make_box(
+		vmath.vector3(left, bottom + bt, 0.125),
+		vmath.vector3(bt, THEME_BTN_H - bt * 2, 0),
+		border
+	)
+	nodes[#nodes + 1] = make_box(
+		vmath.vector3(right - bt, bottom + bt, 0.125),
+		vmath.vector3(bt, THEME_BTN_H - bt * 2, 0),
+		border
+	)
+
+	local label = make_label(
+		vmath.vector3((left + right) * 0.5, (bottom + top) * 0.5, 0.13),
+		THEME.toggle_label,
+		gui.PIVOT_CENTER,
+		THEME.text
+	)
+	gui.set_scale(label, vmath.vector3(THEME_BTN_FONT, THEME_BTN_FONT, 1))
+	nodes[#nodes + 1] = label
+
+	self.theme_btn = {
+		nodes = nodes,
+		left = left,
+		right = right,
+		bottom = bottom,
+		top = top,
+	}
+end
+
 --- HUD: координаты заданы в эталонных единицах сцены (BASE_W x BASE_H),
 --- поэтому их пропорции не зависят от фактического размера окна.
 local function build_hud(self)
@@ -1085,16 +1193,16 @@ local function build_hud(self)
 	end
 
 	-- Сверху — заголовок и счётчик оставшихся кубиков,
-	-- снизу — счётчик уже разобранных.
-	self.heading = make_label(vmath.vector3(w / 2, h - h * 0.05, 0.1), "КВАДРОК", gui.PIVOT_N, COLOR_TEXT)
-	self.title = make_label(vmath.vector3(w / 2, h - h * 0.105, 0.1), "", gui.PIVOT_N, COLOR_TEXT)
-	self.status = make_label(vmath.vector3(w / 2, h * 0.095, 0.1), "", gui.PIVOT_S, COLOR_TEXT_DIM)
+	-- снизу — счётчик уже разобранных. Цвета текста берутся из текущей темы.
+	self.heading = make_label(vmath.vector3(w / 2, h - h * 0.05, 0.1), "КВАДРОК", gui.PIVOT_N, THEME.text)
+	self.title = make_label(vmath.vector3(w / 2, h - h * 0.105, 0.1), "", gui.PIVOT_N, THEME.text)
+	self.status = make_label(vmath.vector3(w / 2, h * 0.095, 0.1), "", gui.PIVOT_S, THEME.text_dim)
 	-- Сохраняем актуальную подсказку при пересоздании узла (например, после resize).
 	self.hint = make_label(
 		vmath.vector3(w / 2, h * 0.05, 0.1),
 		self.hint_text or HINT_PLAY,
 		gui.PIVOT_S,
-		COLOR_TEXT_DIM
+		THEME.text_dim
 	)
 
 	-- Размер шрифта пропорционален стороне поля (22 px при поле ~420 px).
@@ -1104,6 +1212,9 @@ local function build_hud(self)
 	for i = 1, #labels do
 		gui.set_scale(labels[i], vmath.vector3(font_scale, font_scale, 1))
 	end
+
+	-- Кнопка переключения темы в правом верхнем углу.
+	build_theme_button(self)
 
 	-- Узлы пересозданы пустыми — заставляем счётчики перерисоваться.
 	self.shown_removed = nil
@@ -1150,14 +1261,14 @@ local function build_overlay(self)
 	nodes[#nodes + 1] = make_box(
 		vmath.vector3(cx - panel_w * 0.5, cy - panel_h * 0.5, 0.7),
 		vmath.vector3(panel_w, panel_h, 0),
-		vmath.vector4(0.06, 0.09, 0.13, 0.94)
+		THEME.panel
 	)
 
 	local title = make_label(
 		vmath.vector3(cx, cy + panel_h * 0.14, 0.72),
 		info.title,
 		gui.PIVOT_CENTER,
-		COLOR_TEXT
+		THEME.text
 	)
 	gui.set_scale(title, vmath.vector3(font_scale * 1.05, font_scale * 1.05, 1))
 	nodes[#nodes + 1] = title
@@ -1166,7 +1277,7 @@ local function build_overlay(self)
 		vmath.vector3(cx, cy - panel_h * 0.20, 0.72),
 		info.hint,
 		gui.PIVOT_CENTER,
-		COLOR_TEXT_DIM
+		THEME.text_dim
 	)
 	gui.set_scale(hint, vmath.vector3(font_scale * 0.9, font_scale * 0.9, 1))
 	nodes[#nodes + 1] = hint
@@ -1482,6 +1593,101 @@ advance_level = function(self)
 	start_round(self)
 end
 
+--- Делает тему текущей и сразу меняет фон приложения. В .gui background_color
+--- не задан, поэтому виден именно render clear color.
+local function set_theme(name)
+	THEME = THEMES[name] or THEMES.dark
+	msg.post("@render:", "clear_color", { color = THEME.bg })
+end
+
+--- Досрочно завершает все анимации, чтобы после пересоздания узлов (смена
+--- темы) пиксельные координаты кубиков не разъехались с новой геометрией.
+local function settle_animations(self)
+	if self.move_anim then
+		clear_move_nodes(self)
+		self.board_render = nil
+	end
+
+	if self.clear_anim then
+		local count = self.clear_anim.count
+		clear_fly_nodes(self)
+		self.board_render = nil
+		self.removed_cubes = (self.removed_cubes or 0) + count
+		update_hud(self)
+	end
+
+	if not self.piece and self.state ~= "gameover" then
+		spawn(self)
+		if self.state == "gameover" then
+			return
+		end
+	end
+
+	if self.land_anim then
+		self.land_anim = nil
+		commit_piece(self)
+		if self.state == "gameover" then
+			return
+		end
+	end
+
+	if self.return_anim and self.piece then
+		local piece = self.piece
+		piece.x = self.return_anim.sx
+		piece.y = self.return_anim.sy
+		self.return_anim = nil
+		self.drag = nil
+	end
+end
+
+--- Применяет тему ко всем элементам сцены: фону, полю, фигуре, контуру,
+--- HUD и табличке окончания партии. Кэши блоков и подсветки пересобираются,
+--- потому что в них лежат готовые пиксели прежней темы.
+local function apply_theme(self, name)
+	set_theme(name)
+	self.theme_name = (THEME == THEMES.light) and "light" or "dark"
+
+	prepare_blocks()
+	prepare_piece_colors()
+	ALPHA_CACHE = {}
+	HIGHLIGHT_CACHE = {}
+
+	settle_animations(self)
+	build_board_node(self)
+	build_hud(self)
+	build_frame(self)
+	if self.piece then
+		build_piece_nodes(self)
+		-- Восстанавливаем подсказку цветом: во время перетаскивания деталь
+		-- приглушена, если её нельзя оставить на поле.
+		local supported = (not self.drag) or drop_supported(self)
+		color_piece_nodes(self, supported)
+	end
+	build_overlay(self)
+	refresh(self)
+	update_highlight(self)
+end
+
+--- Переключает тему на противоположную и запоминает выбор пользователя.
+local function toggle_theme(self)
+	local next_name = (self.theme_name == "light") and "dark" or "light"
+	apply_theme(self, next_name)
+	progress.save_theme(next_name)
+end
+
+--- Попадает ли тап в кнопку переключения темы.
+local function theme_button_hit(self, action)
+	local btn = self.theme_btn
+	if not btn then
+		return false
+	end
+	local x, y = touch_xy(self, action)
+	if x == nil then
+		return false
+	end
+	return x >= btn.left and x <= btn.right and y >= btn.bottom and y <= btn.top
+end
+
 function init(self)
 	-- Восстанавливаем прогресс с устройства: игра продолжается с того поля,
 	-- на котором игрок остановился в прошлый раз.
@@ -1492,6 +1698,11 @@ function init(self)
 		game.set_field_size(game.MIN_FIELD_SIZE)
 	end
 	game.set_extra_rounds(progress.load_extra_rounds())
+
+	-- Тема оформления восстанавливается до отрисовки, чтобы первый кадр
+	-- сразу показывался в выбранных пользователем цветах.
+	self.theme_name = progress.load_theme() or "dark"
+	set_theme(self.theme_name)
 
 	self.removed_cubes = 0
 	self.state = "play"
@@ -1747,6 +1958,13 @@ end
 function on_input(self, action_id, action)
 	if action_id ~= hash("touch") then
 		return false
+	end
+
+	-- Кнопка переключения темы работает всегда, даже во время анимаций и
+	-- после окончания партии: это настройка оформления, а не игровое действие.
+	if action.pressed and theme_button_hit(self, action) then
+		toggle_theme(self)
+		return true
 	end
 
 	-- Пока кубики убираются/сдвигаются или деталь летит в центр, ввод
