@@ -71,18 +71,21 @@ local DRAG_LIFT_MIN_CELLS = 2
 -- жёлтый или красный) каждые BONUS_INTERVAL ходов в случайной заполненной
 -- ячейке появляется золотой или серебряный кубик. Он переливается и блестит
 -- и остаётся призовым навсегда: пропадает только вместе с собранной линией,
--- одновременно запуская призовой эффект — следующая фигура каждые
--- BONUS_SPIN_STEP_DELAY секунд поворачивается на 90°, пока игрок её не захватит.
+-- одновременно запуская один из двух призовых эффектов (выбирается случайно).
 local BONUS_INTERVAL = 4
 -- Одновременно на поле может быть не больше BONUS_MAX призовых кубиков.
 local BONUS_MAX = 5
 -- Жёлтая фаза начинается с 30% заполнения — с этого момента появляются бонусы.
 local BONUS_FILL_MIN = 0.3
--- Призовой эффект: фигура не крутится непрерывно, а меняет положение
--- ступенчато — на 90° раз в полсекунды. Поворот реальный: меняются клетки
--- фигуры, поэтому после захвата она остаётся в том положении, в котором её
--- взял игрок.
+-- Призовой эффект «вращение»: фигура не крутится непрерывно, а меняет
+-- положение ступенчато — на 90° раз в полсекунды. Поворот реальный: меняются
+-- клетки фигуры, поэтому после захвата она остаётся в том положении, в котором
+-- её взял игрок.
 local BONUS_SPIN_STEP_DELAY = 0.5
+-- Призовой эффект «перебор»: фигура в стартовом квадрате каждые полсекунды
+-- заменяется другой случайной, пока игрок не тапнет. В момент тапа
+-- фиксируется именно та деталь, которая была на экране.
+local BONUS_SHUFFLE_STEP_DELAY = 0.5
 local BONUS_GOLD = { 255, 201, 64 }
 local BONUS_SILVER = { 226, 233, 244 }
 
@@ -153,6 +156,7 @@ local HINT_PLAY = "Тащи деталь к краю или к фигуре"
 local HINT_DRAG_OK = "Отпусти — деталь останется"
 local HINT_DRAG_BAD = "Нет опоры — вернётся в центр"
 local HINT_CLEAR = "Ряд собран — кубики убраны"
+local HINT_SHUFFLE = "Деталь меняется — тапни, чтобы зафиксировать"
 
 -- Таблички окончания партии. Заголовки разбиты на две строки, чтобы длинные
 -- фразы гарантированно помещались в плашку на узких экранах.
@@ -1124,8 +1128,8 @@ local function apply_bonus_clear(self, cleared, moves)
 	end
 
 	if collected then
-		-- Призовой эффект: следующая фигура начнёт вращаться.
-		self.spin_bonus = true
+		-- Призовой эффект выбирается случайно: вращение или перебор деталей.
+		self.bonus_effect = (math.random(2) == 1) and "spin" or "shuffle"
 	end
 end
 
@@ -1744,6 +1748,72 @@ local function refresh(self)
 	update_hud(self)
 end
 
+--- Включает призовой эффект «перебор»: деталь в стартовом квадрате меняется
+--- на случайную.
+local function start_shuffle(self)
+	self.shuffle = { t = 0 }
+	set_hint(self, HINT_SHUFFLE)
+end
+
+--- Останавливает перебор. Текущая деталь остаётся как есть — именно её игрок
+--- и захватывает: замена происходит только по таймеру.
+local function stop_shuffle(self)
+	self.shuffle = nil
+end
+
+--- Заменяет деталь в центре зоны появления на другую случайную. Позиция
+--- появления та же, форма и цвет — новые.
+local function replace_piece_random(self)
+	-- Несколько попыток: деталь должна и помещаться в зоне появления, и иметь
+	-- хотя бы одну позицию с опорой — иначе после перебора игрок застрянет.
+	local piece
+	local x, y
+	for _ = 1, 12 do
+		local candidate = game.random_piece()
+		local cx, cy = game.spawn_pos(candidate)
+		if game.can_place(self.board, candidate.cells, cx, cy)
+			and game.has_any_drop(self.board, candidate) then
+			piece = candidate
+			x, y = cx, cy
+			break
+		end
+	end
+	-- Подходящей детали не нашлось — оставляем прежнюю.
+	if not piece then
+		return
+	end
+
+	piece.x = x
+	piece.y = y
+	self.piece = piece
+	self.draw_x = nil
+	self.draw_y = nil
+	self.drag_origin_x = nil
+	self.drag_origin_y = nil
+	build_piece_nodes(self)
+	color_piece_nodes(self, true)
+end
+
+--- Перебор деталей после призового эффекта: раз в BONUS_SHUFFLE_STEP_DELAY
+--- секунд деталь в стартовом квадрате заменяется случайной, пока игрок её не
+--- захватил. Захват фиксирует ту деталь, которая была на экране в тот момент.
+local function update_piece_shuffle(self, dt)
+	local shuffle = self.shuffle
+	if not shuffle then
+		return
+	end
+	-- Перебор идёт только пока деталь лежит в зоне и игрок её не трогает.
+	if not self.piece or self.drag or self.return_anim or self.land_anim then
+		return
+	end
+
+	shuffle.t = (shuffle.t or 0) + dt
+	while shuffle.t >= BONUS_SHUFFLE_STEP_DELAY do
+		shuffle.t = shuffle.t - BONUS_SHUFFLE_STEP_DELAY
+		replace_piece_random(self)
+	end
+end
+
 --- Можно ли оставить деталь в текущей позиции:
 --- все клетки свободны, зона появления не задета и есть опора
 --- (граница поля или ранее поставленная деталь).
@@ -1775,7 +1845,8 @@ local function game_over(self, kind, is_loss)
 	self.piece = nil
 	self.drag = nil
 	self.spin = nil
-	self.spin_bonus = nil
+	self.shuffle = nil
+	self.bonus_effect = nil
 	clear_highlight(self)
 	self.return_anim = nil
 	self.land_anim = nil
@@ -1861,17 +1932,23 @@ spawn = function(self)
 	self.drag_origin_x = nil
 	self.drag_origin_y = nil
 	self.spin = nil
+	self.shuffle = nil
 	build_piece_nodes(self)
-	-- Призовой эффект: собранный призовой кубик заставляет новую фигуру
-	-- вращаться, пока игрок её не захватит.
-	if self.spin_bonus then
-		self.spin_bonus = nil
-		start_spin(self)
-	end
 	-- В центре у детали ещё нет опоры, но приглушение включается только
 	-- во время перетаскивания, поэтому подсвечиваем её обычным цветом.
 	color_piece_nodes(self, true)
 	set_hint(self, HINT_PLAY)
+	-- Призовой эффект: собранный призовой кубик запускает для новой фигуры
+	-- либо вращение, либо перебор деталей — что выпало случайно. Подсказка
+	-- эффекта ставится после обычной, чтобы игрок увидел именно её.
+	local effect = self.bonus_effect
+	if effect == "spin" then
+		self.bonus_effect = nil
+		start_spin(self)
+	elseif effect == "shuffle" then
+		self.bonus_effect = nil
+		start_shuffle(self)
+	end
 	refresh(self)
 end
 
@@ -2024,9 +2101,10 @@ local function start_round(self)
 	self.draw_y = nil
 	self.drag_origin_x = nil
 	self.drag_origin_y = nil
-	-- Призовые кубики и вращение на новом поле не переносятся.
+	-- Призовые кубики и призовые эффекты на новом поле не переносятся.
 	self.spin = nil
-	self.spin_bonus = nil
+	self.shuffle = nil
+	self.bonus_effect = nil
 	self.moves_since_bonus = 0
 	self.bonus_t = 0
 	clear_bonuses(self)
@@ -2205,13 +2283,14 @@ function init(self)
 	self.overlay_info = nil
 	self.draw_x = nil
 	self.draw_y = nil
-	-- Призовые кубики и вращение начинаются с чистого состояния.
+	-- Призовые кубики и призовые эффекты начинаются с чистого состояния.
 	self.bonuses = nil
 	self.bonus_t = 0
 	self.bonus_sync = nil
 	self.moves_since_bonus = 0
 	self.spin = nil
-	self.spin_bonus = nil
+	self.shuffle = nil
+	self.bonus_effect = nil
 
 	prepare_blocks()
 	prepare_piece_colors()
@@ -2367,8 +2446,10 @@ function update(self, dt)
 		update_move_anim(self, dt)
 	end
 
-	-- Вращение фигуры после призового эффекта: только пока её не захватили.
+	-- Призовые эффекты: вращение или перебор деталей в зоне появления,
+	-- пока игрок не захватил деталь.
 	update_piece_spin(self, dt)
+	update_piece_shuffle(self, dt)
 
 	-- Короткое «прилипание» отпущенной детали к клетке: подсветка уже
 	-- показала, куда она встанет, поэтому остаётся только убрать дробный
@@ -2521,9 +2602,11 @@ function on_input(self, action_id, action)
 			return true
 		end
 
-		-- Игрок захватил вращающуюся фигуру — вращение прекращается, и она
-		-- дальше ведёт себя как обычная деталь.
+		-- Игрок захватил деталь — призовой эффект прекращается, и она дальше
+		-- ведёт себя как обычная деталь. При переборе фиксируется именно та
+		-- деталь, которая была на экране в момент тапа.
 		stop_spin(self)
+		stop_shuffle(self)
 
 		-- Захват: запоминаем дробное смещение точки внутри детали, чтобы она
 		-- не «прыгала» при первом же сдвиге. Если тап пришёлся на свободную
