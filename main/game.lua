@@ -203,6 +203,48 @@ local function signature(cells)
 	return table.concat(parts, ";")
 end
 
+--- Габариты набора клеток: ширина и высота ограничивающего прямоугольника.
+function M.cells_size(cells)
+	local w, h = 0, 0
+	for i = 1, #cells do
+		if cells[i][1] + 1 > w then w = cells[i][1] + 1 end
+		if cells[i][2] + 1 > h then h = cells[i][2] + 1 end
+	end
+	return w, h
+end
+
+--- Поворачивает набор клеток по часовой стрелке на steps * 90°
+--- (steps приводится к 0..3). Возвращает новый нормализованный набор.
+function M.rotate_cells(cells, steps)
+	steps = math.floor(tonumber(steps) or 0) % 4
+	if steps < 0 then
+		steps = steps + 4
+	end
+	local out = {}
+	for i = 1, #cells do
+		out[i] = { cells[i][1], cells[i][2] }
+	end
+	for _ = 1, steps do
+		out = rotate_cw(out)
+	end
+	return out
+end
+
+--- Поворачивает деталь по часовой стрелке на steps * 90°, сохраняя цвет и
+--- текущую позицию. Возвращает новую таблицу детали (исходная не меняется).
+function M.rotate_piece(piece, steps)
+	local cells = M.rotate_cells(piece.cells, steps)
+	local w, h = M.cells_size(cells)
+	return {
+		cells = cells,
+		w = w,
+		h = h,
+		color = piece.color,
+		x = piece.x,
+		y = piece.y,
+	}
+end
+
 --- Собирает набор фигур со всеми уникальными поворотами.
 local function build_shapes(base)
 	local shapes = {}

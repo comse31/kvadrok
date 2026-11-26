@@ -79,21 +79,12 @@ local BONUS_MAX = 5
 -- Жёлтая фаза начинается с 30% заполнения — с этого момента появляются бонусы.
 local BONUS_FILL_MIN = 0.3
 -- Призовой эффект: фигура не крутится непрерывно, а меняет положение
--- ступенчато — на 90° раз в полсекунды.
+-- ступенчато — на 90° раз в полсекунды. Поворот реальный: меняются клетки
+-- фигуры, поэтому после захвата она остаётся в том положении, в котором её
+-- взял игрок.
 local BONUS_SPIN_STEP_DELAY = 0.5
-local BONUS_SPIN_STEP = math.pi * 0.5
 local BONUS_GOLD = { 255, 201, 64 }
 local BONUS_SILVER = { 226, 233, 244 }
-
--- Единичный кватернион: сбрасывает поворот узлов детали после вращения.
--- Создаётся лениво, чтобы модуль загружался даже без vmath (тесты/моки).
-local QUAT_ID
-local function identity_quat()
-	if not QUAT_ID then
-		QUAT_ID = vmath.quat()
-	end
-	return QUAT_ID
-end
 
 -- Палитры оформления. Переключение темы меняет фон приложения (clear_color),
 -- цвета поля, фигур, текста, плашек и кнопки переключения. Цвета фигур заданы
@@ -1230,79 +1221,35 @@ local function update_bonus_fly(self, dt)
 	end
 end
 
+-- Предварительное объявление: поворот детали пересобирает её узлы, а
+-- build_piece_nodes() определена ниже.
+local apply_piece_rotation
+
 --- Включает ступенчатый поворот текущей фигуры: на 90° каждые полсекунды.
 local function start_spin(self)
-	self.spin = { angle = 0, t = 0 }
+	self.spin = { t = 0 }
 end
 
---- Останавливает вращение и возвращает узлы детали в обычное положение.
+--- Останавливает поворот. Сама деталь остаётся в том положении (ориентации),
+--- в котором её захватил игрок: поворот менял реальные клетки фигуры.
 local function stop_spin(self)
-	if not self.spin then
-		return
-	end
 	self.spin = nil
-	if self.piece_nodes then
-		local q = identity_quat()
-		for i = 1, #self.piece_nodes do
-			local n = self.piece_nodes[i]
-			gui.set_rotation(n.fill, q)
-			gui.set_rotation(n.hi, q)
-			gui.set_pivot(n.fill, gui.PIVOT_SW)
-			gui.set_pivot(n.hi, gui.PIVOT_SW)
-		end
-	end
-	if self.piece then
-		snap_piece_nodes(self)
-	end
 end
 
---- Поворачивает узлы детали вокруг её геометрического центра ступенчато:
---- раз в BONUS_SPIN_STEP_DELAY секунд угол меняется на 90°. Вращаются только
---- кубики и их подсветка; сама клеточная позиция и логика не меняются.
+--- Ступенчатый поворот фигуры после призового эффекта: раз в
+--- BONUS_SPIN_STEP_DELAY секунд деталь реально поворачивается на 90° по
+--- часовой стрелке, оставаясь в центре зоны появления. Так игрок захватывает
+--- фигуру в уже повёрнутом положении, и она фиксируется именно такой.
 local function update_piece_spin(self, dt)
 	local spin = self.spin
-	local piece = self.piece
-	if not spin or not piece or not self.piece_nodes then
+	if not spin or not self.piece then
 		return
 	end
 
 	spin.t = (spin.t or 0) + dt
 	while spin.t >= BONUS_SPIN_STEP_DELAY do
 		spin.t = spin.t - BONUS_SPIN_STEP_DELAY
-		spin.angle = (spin.angle + BONUS_SPIN_STEP) % (math.pi * 2)
-	end
-	local ang = spin.angle
-	local c, s = math.cos(ang), math.sin(ang)
-	local cell = self.cell
-	local hi_h = math.max(1, cell * PIECE_HI_R)
-	local bx = self.origin_x + (self.draw_x or piece.x) * cell
-	local by = self.origin_y + (self.draw_y or piece.y) * cell
-	local pcx = bx + piece.w * cell * 0.5
-	local pcy = by + piece.h * cell * 0.5
-	local q = vmath.quat_rotation_z(ang)
-
-	for i = 1, #self.piece_nodes do
-		local n = self.piece_nodes[i]
-		-- Центр кубика и центр его верхней подсветки до вращения.
-		local fdx = bx + (n.cx + 0.5) * cell - pcx
-		local fdy = by + (n.cy + 0.5) * cell - pcy
-		local hdx = fdx
-		local hdy = by + (n.cy + 1) * cell - hi_h * 0.5 - pcy
-
-		local rfx = pcx + fdx * c - fdy * s
-		local rfy = pcy + fdx * s + fdy * c
-		local rhx = pcx + hdx * c - hdy * s
-		local rhy = pcy + hdx * s + hdy * c
-
-		gui.set_pivot(n.fill, gui.PIVOT_CENTER)
-		gui.set_position(n.fill, vmath.vector3(rfx, rfy, 0.5))
-		gui.set_size(n.fill, vmath.vector3(cell, cell, 0))
-		gui.set_rotation(n.fill, q)
-
-		gui.set_pivot(n.hi, gui.PIVOT_CENTER)
-		gui.set_position(n.hi, vmath.vector3(rhx, rhy, 0.52))
-		gui.set_size(n.hi, vmath.vector3(cell, hi_h, 0))
-		gui.set_rotation(n.hi, q)
+		apply_piece_rotation(self)
 	end
 end
 
@@ -1504,6 +1451,35 @@ local function build_piece_nodes(self)
 	end
 	self.piece_nodes = nodes
 	snap_piece_nodes(self)
+end
+
+--- Поворачивает текущую деталь на 90° по часовой стрелке и пересобирает её
+--- узлы. Меняются реальные клетки фигуры (форма и габариты), а не только
+--- картинка, поэтому после захвата игрок получает именно это положение.
+--- Деталь остаётся в центре зоны появления.
+apply_piece_rotation = function(self)
+	local piece = self.piece
+	if not piece or self.drag or self.return_anim or self.land_anim then
+		return
+	end
+
+	local rotated = game.rotate_piece(piece, 1)
+	local x, y = game.spawn_pos(rotated)
+	-- Страховка: если повёрнутая деталь почему-то не помещается, оставляем
+	-- её как есть, чтобы не сломать поле.
+	if not game.can_place(self.board, rotated.cells, x, y) then
+		return
+	end
+
+	rotated.x = x
+	rotated.y = y
+	self.piece = rotated
+	self.draw_x = nil
+	self.draw_y = nil
+	self.drag_origin_x = nil
+	self.drag_origin_y = nil
+	build_piece_nodes(self)
+	color_piece_nodes(self, true)
 end
 
 -- Предварительное объявление: touch_xy() использует резервный путь через
