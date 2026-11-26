@@ -67,6 +67,29 @@ local LAND_DURATION = 0.07
 local DRAG_LIFT_R = 0.062
 local DRAG_LIFT_MIN_CELLS = 2
 
+-- Призовые кубики. В жёлтой и красной фазе (контур стартового квадрата
+-- жёлтый или красный) каждые BONUS_INTERVAL ходов в случайной заполненной
+-- ячейке появляется золотой или серебряный кубик. Он переливается и блестит
+-- и остаётся призовым навсегда: пропадает только вместе с собранной линией,
+-- одновременно запуская призовой эффект — следующая фигура начинает
+-- вращаться, пока игрок её не захватит.
+local BONUS_INTERVAL = 4
+-- Жёлтая фаза начинается с 30% заполнения — с этого момента появляются бонусы.
+local BONUS_FILL_MIN = 0.3
+local BONUS_SPIN_RATE = 3
+local BONUS_GOLD = { 255, 201, 64 }
+local BONUS_SILVER = { 226, 233, 244 }
+
+-- Единичный кватернион: сбрасывает поворот узлов детали после вращения.
+-- Создаётся лениво, чтобы модуль загружался даже без vmath (тесты/моки).
+local QUAT_ID
+local function identity_quat()
+	if not QUAT_ID then
+		QUAT_ID = vmath.quat()
+	end
+	return QUAT_ID
+end
+
 -- Палитры оформления. Переключение темы меняет фон приложения (clear_color),
 -- цвета поля, фигур, текста, плашек и кнопки переключения. Цвета фигур заданы
 -- в RGB 0..255 — из них собираются пиксели текстуры поля и цвета узлов детали.
@@ -480,29 +503,22 @@ local function lerp(a, b, t)
 end
 
 --- Цвет контура для доли заполнения поля 0..1:
---- до 50% — между зелёным и жёлтым, но ближе к зелёному;
---- 50–80% — между зелёным и жёлтым, но ближе к жёлтому;
---- выше 80% — от жёлтого к красному.
-local FILL_HALF = 0.5
-local FILL_YELLOW_MAX = 0.8
+--- 0–30% — зелёный -> жёлтый (чистый жёлтый на 30%);
+--- 30–70% — жёлтый -> красный;
+--- выше 70% — чистый красный.
+local FILL_WARN = 0.3
+local FILL_BAD = 0.7
 
 local function frame_color(value)
 	local from, to, t
-	if value < FILL_YELLOW_MAX then
-		-- Зелёный -> жёлтый, но с опорной точкой на 50%: там смешение ровно
-		-- посередине. Значит до 50% цвет ближе к зелёному, а на 50–80% —
-		-- ближе к жёлтому (к 80% доходит до чистого жёлтого).
-		local k
-		if value < FILL_HALF then
-			k = 0.5 * (value / FILL_HALF)
-		else
-			k = 0.5 + 0.5 * ((value - FILL_HALF) / (FILL_YELLOW_MAX - FILL_HALF))
-		end
-		from, to, t = COLOR_OK, COLOR_WARN, k
+	if value < FILL_WARN then
+		from, to, t = COLOR_OK, COLOR_WARN, value / FILL_WARN
 	else
-		-- Жёлтый -> красный на последних 20% заполнения.
-		from, to, t = COLOR_WARN, COLOR_BAD,
-			(value - FILL_YELLOW_MAX) / (1 - FILL_YELLOW_MAX)
+		local k = (value - FILL_WARN) / (FILL_BAD - FILL_WARN)
+		if k > 1 then
+			k = 1
+		end
+		from, to, t = COLOR_WARN, COLOR_BAD, k
 	end
 	return vmath.vector4(
 		lerp(from[1], to[1], t) / 255,
@@ -831,6 +847,447 @@ local function update_highlight(self)
 		self.hl_col_bands = build_bands(cols)
 		self.hl_row_bands = build_bands(rows)
 		upload_board(self)
+	end
+end
+
+--- Цвет призового кубика в текущий момент анимации: перелив металла
+--- (медленная волна яркости) плюс короткий яркий блик поверх волны.
+--- Возвращает компоненты r, g, b (0..1) и силу блика glint (0..1).
+local function bonus_anim_color(kind, t, phase)
+	local base = (kind == "silver") and BONUS_SILVER or BONUS_GOLD
+	local wave = 0.5 + 0.5 * math.sin(t * 2.4 + phase)
+	local heat = 0.75 + 0.35 * wave
+	local r = base[1] * heat
+	local g = base[2] * heat
+	local b = base[3] * heat
+	if kind == "silver" then
+		-- Серебро холоднее: чуть меньше красного, больше синего.
+		r = r * 0.96
+		b = b * 1.10
+	else
+		-- Золото теплее: больше красного, меньше синего.
+		r = r * 1.10
+		b = b * 0.90
+	end
+	local glint = math.max(0, math.sin(t * 5.2 + phase * 1.9))
+	glint = glint * glint * glint * glint
+	r = r + (255 - r) * glint
+	g = g + (255 - g) * glint
+	b = b + (255 - b) * glint
+	if r > 255 then r = 255 end
+	if g > 255 then g = 255 end
+	if b > 255 then b = 255 end
+	return r / 255, g / 255, b / 255, glint
+end
+
+--- Удаляет узлы одного призового кубика (если они созданы).
+local function free_bonus_nodes(b)
+	local n = b.nodes
+	if n then
+		gui.delete_node(n.fill)
+		gui.delete_node(n.hi)
+		gui.delete_node(n.glint)
+		b.nodes = nil
+	end
+end
+
+--- Создаёт узлы призового кубика в его клетке: металлическая подложка,
+--- верхняя грань и бегущий блик. Координаты — в единицах сцены.
+local function make_bonus_nodes(self, b)
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+	local cx = self.origin_x + (b.x + 0.5) * cell
+	local cy = self.origin_y + (b.y + 0.5) * cell
+	b.cx = cx
+	b.cy = cy
+	b.as = cell * 0.5
+
+	local r, g, bl = bonus_anim_color(b.kind, 0, 0)
+	-- Призовые кубики лежат поверх поля, но под деталью в руке (z = 0.5).
+	local fill = make_box(
+		vmath.vector3(cx, cy, 0.40),
+		vmath.vector3(cell, cell, 0),
+		vmath.vector4(r, g, bl, 1)
+	)
+	gui.set_pivot(fill, gui.PIVOT_CENTER)
+
+	local hi = make_box(
+		vmath.vector3(cx, cy + cell * 0.5 - hi_h * 0.5, 0.41),
+		vmath.vector3(cell, hi_h, 0),
+		vmath.vector4(1, 1, 1, 1)
+	)
+	gui.set_pivot(hi, gui.PIVOT_CENTER)
+
+	local glint = make_box(
+		vmath.vector3(cx, cy, 0.42),
+		vmath.vector3(math.max(1, cell * 0.14), cell * 0.92, 0),
+		vmath.vector4(1, 1, 1, 0.6)
+	)
+	gui.set_pivot(glint, gui.PIVOT_CENTER)
+
+	b.nodes = { fill = fill, hi = hi, glint = glint }
+end
+
+--- Пересоздаёт узлы всех призовых кубиков под текущую геометрию и тему.
+local function sync_bonus_nodes(self)
+	self.bonus_sync = nil
+	local list = self.bonuses
+	if not list then
+		return
+	end
+	for i = 1, #list do
+		free_bonus_nodes(list[i])
+	end
+	for i = 1, #list do
+		local b = list[i]
+		local row = self.board[b.y]
+		if row and row[b.x] ~= 0 then
+			make_bonus_nodes(self, b)
+		end
+	end
+end
+
+--- Удаляет узлы всех призовых кубиков, не трогая сам список.
+local function drop_bonus_nodes(self)
+	local list = self.bonuses
+	if not list then
+		return
+	end
+	for i = 1, #list do
+		free_bonus_nodes(list[i])
+	end
+end
+
+--- Полностью очищает призовые кубики (список и узлы).
+local function clear_bonuses(self)
+	drop_bonus_nodes(self)
+	self.bonuses = nil
+	self.bonus_sync = nil
+end
+
+--- Анимирует призовые кубики: перелив цвета и бегущий по клетке блик.
+local function update_bonus_anim(self, dt)
+	local list = self.bonuses
+	if not list then
+		return
+	end
+	self.bonus_t = (self.bonus_t or 0) + dt
+	local t = self.bonus_t
+	for i = 1, #list do
+		local b = list[i]
+		local n = b.nodes
+		if n then
+			local r, g, bl, glint = bonus_anim_color(b.kind, t, i * 0.9)
+			gui.set_color(n.fill, vmath.vector4(r, g, bl, 1))
+			gui.set_color(n.hi, vmath.vector4(
+				math.min(1, r * 1.15 + 0.10),
+				math.min(1, g * 1.15 + 0.10),
+				math.min(1, bl * 1.15 + 0.10),
+				1
+			))
+			-- Блик ходит по клетке туда-сюда.
+			local k = 0.5 + 0.5 * math.sin(t * 2.8 + i * 1.3)
+			gui.set_position(n.glint, vmath.vector3(
+				b.cx - b.as + b.as * 2 * k, b.cy, 0.42
+			))
+			gui.set_color(n.glint, vmath.vector4(1, 1, 1, 0.12 + 0.78 * glint))
+		end
+	end
+end
+
+--- Есть ли призовой кубик в клетке (x, y).
+local function bonus_at(self, x, y)
+	local list = self.bonuses
+	if not list then
+		return false
+	end
+	for i = 1, #list do
+		if list[i].x == x and list[i].y == y then
+			return true
+		end
+	end
+	return false
+end
+
+--- Удаляет узлы призовых кубиков, улетающих в центр.
+local function clear_bonus_fly(self)
+	local anim = self.bonus_fly
+	if anim then
+		for i = 1, #anim.cubes do
+			local f = anim.cubes[i]
+			gui.delete_node(f.fill)
+			gui.delete_node(f.glint)
+		end
+		self.bonus_fly = nil
+	end
+end
+
+--- Запускает улёт собранных призовых кубиков в центр поля: кубик уменьшается
+--- и растворяется, как обычные кубики при сборе линии.
+local function start_bonus_fly(self, collected_list)
+	if #collected_list == 0 then
+		return
+	end
+	clear_bonus_fly(self)
+
+	local cell = self.cell
+	local to_x = self.origin_x + self.board_size * 0.5
+	local to_y = self.origin_y + self.board_size * 0.5
+	local fly = {}
+	for i = 1, #collected_list do
+		local c = collected_list[i]
+		local b = c.bonus
+		local from_x = self.origin_x + (b.x + 0.5) * cell
+		local from_y = self.origin_y + (b.y + 0.5) * cell
+		local r, g, bl = bonus_anim_color(b.kind, 0, 0)
+
+		local fill = make_box(
+			vmath.vector3(from_x, from_y, 0.64),
+			vmath.vector3(cell, cell, 0),
+			vmath.vector4(r, g, bl, 1)
+		)
+		gui.set_pivot(fill, gui.PIVOT_CENTER)
+		local glint = make_box(
+			vmath.vector3(from_x, from_y, 0.65),
+			vmath.vector3(math.max(1, cell * 0.14), cell * 0.92, 0),
+			vmath.vector4(1, 1, 1, 0.7)
+		)
+		gui.set_pivot(glint, gui.PIVOT_CENTER)
+
+		fly[i] = {
+			fill = fill,
+			glint = glint,
+			kind = b.kind,
+			from_x = from_x,
+			from_y = from_y,
+			to_x = to_x,
+			to_y = to_y,
+			color = { r, g, bl },
+			delay = 0.05 * i,
+		}
+	end
+
+	self.bonus_fly = { t = 0, cubes = fly }
+end
+
+--- Обрабатывает призовые кубики после сбора линий: попавшие в убранные
+--- клетки улетают в центр и дают призовой эффект, остальные сдвигаются
+--- вместе с полем (их узлы пересоздаются после завершения анимации сдвига).
+local function apply_bonus_clear(self, cleared, moves)
+	local list = self.bonuses
+	if not list then
+		return
+	end
+
+	local cleared_set = {}
+	for i = 1, #cleared do
+		cleared_set[cleared[i].x .. ":" .. cleared[i].y] = true
+	end
+
+	local collected = false
+	local collected_list = {}
+	for i = #list, 1, -1 do
+		local b = list[i]
+		if cleared_set[b.x .. ":" .. b.y] then
+			-- Узлы кубика уже на поле: сначала запускаем их улёт, потом
+			-- заменяем их летящими узлами.
+			collected_list[#collected_list + 1] = { bonus = b }
+			free_bonus_nodes(b)
+			table.remove(list, i)
+			collected = true
+		end
+	end
+
+	if collected then
+		-- Улёт к центру: визуальная награда за собранный ряд.
+		start_bonus_fly(self, collected_list)
+	end
+
+	if moves then
+		local map = {}
+		for i = 1, #moves do
+			local m = moves[i]
+			map[m.from_x .. ":" .. m.from_y] = m
+		end
+		for i = 1, #list do
+			local b = list[i]
+			local m = map[b.x .. ":" .. b.y]
+			if m then
+				b.x = m.to_x
+				b.y = m.to_y
+			end
+		end
+	end
+
+	if #list == 0 then
+		self.bonuses = nil
+	else
+		-- Во время анимации призовые кубики скрыты, чтобы не «прыгать».
+		drop_bonus_nodes(self)
+		self.bonus_sync = true
+	end
+
+	if collected then
+		-- Призовой эффект: следующая фигура начнёт вращаться.
+		self.spin_bonus = true
+	end
+end
+
+--- Добавляет призовой кубик в случайную заполненную клетку.
+local function start_bonus(self)
+	local candidates = {}
+	for y = 0, game.H - 1 do
+		local row = self.board[y]
+		for x = 0, game.W - 1 do
+			if row[x] ~= 0 and not bonus_at(self, x, y) then
+				candidates[#candidates + 1] = { x, y }
+			end
+		end
+	end
+	if #candidates == 0 then
+		return
+	end
+
+	local pick = candidates[math.random(#candidates)]
+	local b = {
+		x = pick[1],
+		y = pick[2],
+		kind = (math.random(2) == 1) and "gold" or "silver",
+	}
+	self.bonuses = self.bonuses or {}
+	self.bonuses[#self.bonuses + 1] = b
+
+	-- Во время анимаций поле рисуется в промежуточном состоянии, поэтому
+	-- узлы призового кубика создаются после их завершения.
+	if self.clear_anim or self.move_anim or self.board_render then
+		self.bonus_sync = true
+	else
+		make_bonus_nodes(self, b)
+	end
+end
+
+--- Учитывает очередной ход: в жёлтой/красной фазе каждые BONUS_INTERVAL
+--- ходов добавляет новый призовой кубик.
+--- Время жизни у призовых кубиков нет: они остаются призовыми, пока их не
+--- уберёт собранная линия (тогда же срабатывает призовой эффект).
+local function advance_bonus(self)
+	-- Появление призовых кубиков включается только в жёлтой (>= 30%
+	-- заполнения) и красной фазе. Вне фазы счётчик ходов сбрасывается,
+	-- поэтому «каждые 4 хода» отсчитываются именно внутри фазы.
+	if game.fill_ratio(self.board) < BONUS_FILL_MIN then
+		self.moves_since_bonus = 0
+		return
+	end
+
+	self.moves_since_bonus = (self.moves_since_bonus or 0) + 1
+	if self.moves_since_bonus >= BONUS_INTERVAL then
+		self.moves_since_bonus = 0
+		start_bonus(self)
+	end
+end
+
+--- Анимирует улёт призовых кубиков в центр поля.
+local function update_bonus_fly(self, dt)
+	local anim = self.bonus_fly
+	if not anim then
+		return
+	end
+	anim.t = anim.t + dt
+
+	for i = 1, #anim.cubes do
+		local f = anim.cubes[i]
+		local k = (anim.t - f.delay) / CLEAR_CUBE_DURATION
+		if k < 0 then
+			k = 0
+		elseif k > 1 then
+			k = 1
+		end
+		local e = k * k
+		local x = lerp(f.from_x, f.to_x, e)
+		local y = lerp(f.from_y, f.to_y, e)
+		local size = self.cell * (0.25 + 0.75 * (1 - k))
+		local alpha = 1 - k * k * k
+		gui.set_position(f.fill, vmath.vector3(x, y, 0.64))
+		gui.set_size(f.fill, vmath.vector3(size, size, 0))
+		gui.set_color(f.fill, vmath.vector4(f.color[1], f.color[2], f.color[3], alpha))
+		gui.set_position(f.glint, vmath.vector3(x, y, 0.65))
+		gui.set_size(f.glint, vmath.vector3(math.max(1, size * 0.14), size * 0.92, 0))
+		gui.set_color(f.glint, vmath.vector4(1, 1, 1, 0.7 * alpha))
+	end
+
+	if anim.t >= CLEAR_CUBE_DURATION + 0.05 * #anim.cubes then
+		clear_bonus_fly(self)
+	end
+end
+
+--- Включает вращение текущей фигуры (3 оборота в секунду).
+local function start_spin(self)
+	self.spin = { angle = 0 }
+end
+
+--- Останавливает вращение и возвращает узлы детали в обычное положение.
+local function stop_spin(self)
+	if not self.spin then
+		return
+	end
+	self.spin = nil
+	if self.piece_nodes then
+		local q = identity_quat()
+		for i = 1, #self.piece_nodes do
+			local n = self.piece_nodes[i]
+			gui.set_rotation(n.fill, q)
+			gui.set_rotation(n.hi, q)
+			gui.set_pivot(n.fill, gui.PIVOT_SW)
+			gui.set_pivot(n.hi, gui.PIVOT_SW)
+		end
+	end
+	if self.piece then
+		snap_piece_nodes(self)
+	end
+end
+
+--- Вращает узлы детали вокруг её геометрического центра. Вращаются только
+--- кубики и их подсветка; сама клеточная позиция и логика не меняются.
+local function update_piece_spin(self, dt)
+	local spin = self.spin
+	local piece = self.piece
+	if not spin or not piece or not self.piece_nodes then
+		return
+	end
+
+	spin.angle = (spin.angle + dt * BONUS_SPIN_RATE * math.pi * 2) % (math.pi * 2)
+	local ang = spin.angle
+	local c, s = math.cos(ang), math.sin(ang)
+	local cell = self.cell
+	local hi_h = math.max(1, cell * PIECE_HI_R)
+	local bx = self.origin_x + (self.draw_x or piece.x) * cell
+	local by = self.origin_y + (self.draw_y or piece.y) * cell
+	local pcx = bx + piece.w * cell * 0.5
+	local pcy = by + piece.h * cell * 0.5
+	local q = vmath.quat_rotation_z(ang)
+
+	for i = 1, #self.piece_nodes do
+		local n = self.piece_nodes[i]
+		-- Центр кубика и центр его верхней подсветки до вращения.
+		local fdx = bx + (n.cx + 0.5) * cell - pcx
+		local fdy = by + (n.cy + 0.5) * cell - pcy
+		local hdx = fdx
+		local hdy = by + (n.cy + 1) * cell - hi_h * 0.5 - pcy
+
+		local rfx = pcx + fdx * c - fdy * s
+		local rfy = pcy + fdx * s + fdy * c
+		local rhx = pcx + hdx * c - hdy * s
+		local rhy = pcy + hdx * s + hdy * c
+
+		gui.set_pivot(n.fill, gui.PIVOT_CENTER)
+		gui.set_position(n.fill, vmath.vector3(rfx, rfy, 0.5))
+		gui.set_size(n.fill, vmath.vector3(cell, cell, 0))
+		gui.set_rotation(n.fill, q)
+
+		gui.set_pivot(n.hi, gui.PIVOT_CENTER)
+		gui.set_position(n.hi, vmath.vector3(rhx, rhy, 0.52))
+		gui.set_size(n.hi, vmath.vector3(cell, hi_h, 0))
+		gui.set_rotation(n.hi, q)
 	end
 end
 
@@ -1326,6 +1783,8 @@ local function game_over(self, kind, is_loss)
 	self.state = "gameover"
 	self.piece = nil
 	self.drag = nil
+	self.spin = nil
+	self.spin_bonus = nil
 	clear_highlight(self)
 	self.return_anim = nil
 	self.land_anim = nil
@@ -1370,8 +1829,21 @@ local function continue_after_over(self)
 	end
 end
 
+-- Предварительное объявление: after_move() определена выше spawn(), а в Lua
+-- локальная функция видна только после своего объявления.
+local spawn
+
+--- Очередной ход завершён: обновляем призовые кубики (появление нового)
+--- и запускаем следующую деталь.
+local function after_move(self)
+	advance_bonus(self)
+	if self.state ~= "gameover" then
+		spawn(self)
+	end
+end
+
 --- Появление новой фигуры в центре зоны.
-local function spawn(self)
+spawn = function(self)
 	local piece = game.random_piece()
 	local x, y = game.spawn_pos(piece)
 
@@ -1397,7 +1869,14 @@ local function spawn(self)
 	self.draw_y = nil
 	self.drag_origin_x = nil
 	self.drag_origin_y = nil
+	self.spin = nil
 	build_piece_nodes(self)
+	-- Призовой эффект: собранный призовой кубик заставляет новую фигуру
+	-- вращаться, пока игрок её не захватит.
+	if self.spin_bonus then
+		self.spin_bonus = nil
+		start_spin(self)
+	end
 	-- В центре у детали ещё нет опоры, но приглушение включается только
 	-- во время перетаскивания, поэтому подсвечиваем её обычным цветом.
 	color_piece_nodes(self, true)
@@ -1428,6 +1907,9 @@ local function commit_piece(self)
 		-- но ещё без сдвига: сдвигающиеся кубики пока стоят на месте.
 		self.board_render = game.clone_board(self.board)
 		local moves = game.collapse(self.board, rows, cols)
+		-- Призовые кубики: попавшие в убранные линии исчезают и дают
+		-- призовой эффект, остальные сдвигаются вместе с полем.
+		apply_bonus_clear(self, cleared, moves)
 		refresh(self)
 
 		-- Кубики каскадом улетают в центр поля; сдвиг оставшихся,
@@ -1437,8 +1919,7 @@ local function commit_piece(self)
 		return
 	end
 
-	refresh(self)
-	spawn(self)
+	after_move(self)
 end
 
 --- Отпускание детали: остаётся на поле только при наличии опоры.
@@ -1552,6 +2033,13 @@ local function start_round(self)
 	self.draw_y = nil
 	self.drag_origin_x = nil
 	self.drag_origin_y = nil
+	-- Призовые кубики и вращение на новом поле не переносятся.
+	self.spin = nil
+	self.spin_bonus = nil
+	self.moves_since_bonus = 0
+	self.bonus_t = 0
+	clear_bonuses(self)
+	clear_bonus_fly(self)
 	clear_piece_nodes(self)
 	clear_highlight(self)
 	clear_fly_nodes(self)
@@ -1638,6 +2126,12 @@ local function settle_animations(self)
 		self.return_anim = nil
 		self.drag = nil
 	end
+
+	-- Сдвиг завершён: показываем призовые кубики в их новых клетках.
+	if self.bonus_sync then
+		self.bonus_sync = nil
+		sync_bonus_nodes(self)
+	end
 end
 
 --- Применяет тему ко всем элементам сцены: фону, полю, фигуре, контуру,
@@ -1656,6 +2150,9 @@ local function apply_theme(self, name)
 	build_board_node(self)
 	build_hud(self)
 	build_frame(self)
+	-- Призовые кубики пересобираются под новую тему: их узлы окрашиваются
+	-- анимацией, поэтому достаточно пересоздать их на текущей геометрии.
+	sync_bonus_nodes(self)
 	if self.piece then
 		build_piece_nodes(self)
 		-- Восстанавливаем подсказку цветом: во время перетаскивания деталь
@@ -1717,6 +2214,13 @@ function init(self)
 	self.overlay_info = nil
 	self.draw_x = nil
 	self.draw_y = nil
+	-- Призовые кубики и вращение начинаются с чистого состояния.
+	self.bonuses = nil
+	self.bonus_t = 0
+	self.bonus_sync = nil
+	self.moves_since_bonus = 0
+	self.spin = nil
+	self.spin_bonus = nil
 
 	prepare_blocks()
 	prepare_piece_colors()
@@ -1787,6 +2291,10 @@ local function update_clear_anim(self, dt)
 			start_move_anim(self, moves)
 		else
 			self.board_render = nil
+			-- Сдвига нет: призовые кубики снова видны на своих местах.
+			if self.bonus_sync then
+				sync_bonus_nodes(self)
+			end
 			upload_board(self)
 		end
 
@@ -1801,6 +2309,10 @@ local function update_clear_anim(self, dt)
 			game_over(self, kind, false)
 			return
 		end
+
+		-- Ход с собранными линиями тоже считается ходом: обновляем призовые
+		-- кубики. Если был сдвиг, узлы призовых кубиков вернутся после него.
+		advance_bonus(self)
 
 		if not self.move_anim then
 			set_hint(self, HINT_PLAY)
@@ -1835,6 +2347,12 @@ local function update_move_anim(self, dt)
 	if k >= 1 then
 		clear_move_nodes(self)
 		self.board_render = nil
+		-- Призовые кубики сдвинулись вместе с полем — показываем их
+		-- в новых клетках.
+		if self.bonus_sync then
+			self.bonus_sync = nil
+			sync_bonus_nodes(self)
+		end
 		upload_board(self)
 
 		if self.state ~= "gameover" then
@@ -1845,6 +2363,11 @@ local function update_move_anim(self, dt)
 end
 
 function update(self, dt)
+	-- Призовые кубики переливаются и блестят постоянно, независимо от
+	-- остальных анимаций; собранные — улетают в центр.
+	update_bonus_anim(self, dt)
+	update_bonus_fly(self, dt)
+
 	-- Анимации уборки и сдвига кубиков блокируют ввод до своего завершения.
 	if self.clear_anim then
 		update_clear_anim(self, dt)
@@ -1852,6 +2375,9 @@ function update(self, dt)
 	if self.move_anim then
 		update_move_anim(self, dt)
 	end
+
+	-- Вращение фигуры после призового эффекта: только пока её не захватили.
+	update_piece_spin(self, dt)
 
 	-- Короткое «прилипание» отпущенной детали к клетке: подсветка уже
 	-- показала, куда она встанет, поэтому остаётся только убрать дробный
@@ -2003,6 +2529,10 @@ function on_input(self, action_id, action)
 		if not piece_has_cell(piece, cx, cy) and not game.in_zone(cx, cy) then
 			return true
 		end
+
+		-- Игрок захватил вращающуюся фигуру — вращение прекращается, и она
+		-- дальше ведёт себя как обычная деталь.
+		stop_spin(self)
 
 		-- Захват: запоминаем дробное смещение точки внутри детали, чтобы она
 		-- не «прыгала» при первом же сдвиге. Если тап пришёлся на свободную
@@ -2158,6 +2688,8 @@ function on_message(self, message_id, message, sender)
 		build_board_node(self)
 		build_hud(self)
 		build_frame(self)
+		-- Призовые кубики тоже привязаны к пиксельной сетке поля.
+		sync_bonus_nodes(self)
 		build_piece_nodes(self)
 		build_overlay(self)
 		refresh(self)
