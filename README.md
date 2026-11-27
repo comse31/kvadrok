@@ -114,6 +114,67 @@ K кубиков»** — сколько кубиков уже убрано с п
 `BONUS_INTERVAL = 4`, `BONUS_MAX = 5`, `BONUS_SPIN_STEP_DELAY = 0.5`,
 `BONUS_SHUFFLE_STEP_DELAY = 1.0`, `BONUS_FILL_MIN = 0.3`.
 
+## Android-дистрибутив
+
+Игра распространяется двумя способами: как веб-страница (HTML5, `wasm-web`) и как
+**APK для Android**. Обе сборки делает один и тот же workflow
+[`deploy-master.yml`](.github/workflows/deploy-master.yml).
+
+- Внизу экрана HTML5-версии, в одном ряду с кнопками **Fullscreen** и
+  **«Made with Defold»**, есть маленькая ссылка **«скачать для Android»** —
+  она ведёт на `download/kvadrok.apk`.
+- При заходе с **Android-устройства** (определяется по `User-Agent`) сверху
+  отображается плашка-предложение **«Игра доступна как приложение для Android»**
+  с кнопкой **«Установить»**. Закрытие плашки запоминается в `localStorage`
+  (ключ `kvadrok_android_prompt_dismissed`), поэтому при следующем визите она
+  не появляется.
+- APK отдаёт `nginx` по адресу `/download/kvadrok.apk` с MIME
+  `application/vnd.android.package-archive`, `Content-Disposition: attachment`
+  и без кэша (по этому адресу после каждого релиза лежит новая сборка).
+
+Сборка APK выполняется `bob` уже после сборки HTML5-бандла и кладётся внутрь
+веб-бандла (`dist/web/kvadrok/download/kvadrok.apk`), поэтому попадает в образ
+nginx без отдельного тома.
+
+### Почему APK только для arm64
+
+`bob` собирает Android-бандл из движков, упакованных **внутри `bob.jar`**. В
+текущей версии там есть движок только для **`arm64-android`**
+(`libexec/arm64-android/libdmengine_release.so`); для `armv7-android` и
+`x86_64-android` движков нет. Если запросить `armv7-android`, `bob` попытается
+скачать недостающий движок с `d.defold.com`, который на self-hosted хосте
+троттлится, и сборка «зависает» на этапе Bundling. Поэтому собирается только
+`arm64-android` — он покрывает все актуальные Android-устройства.
+
+### Ключ подписи APK
+
+Android отказывается устанавливать обновление APK, подписанное **другим**
+ключом, поэтому ключ должен быть одним и тем же между релизами. Он берётся из
+секретов репозитория:
+
+| Секрет | Назначение |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | Содержимое файла `.keystore` в base64 (`base64 -w0 kvadrok.keystore`). |
+| `ANDROID_KEYSTORE_PASSWORD` | Пароль хранилища и ключа (alias `kvadrok`). |
+
+Если `ANDROID_KEYSTORE_BASE64` не задан, сборка создаёт **временный** ключ
+(`keytool -genkeypair`) и печатает предупреждение: APK установится, но
+обновления поверх предыдущей версии — нет.
+
+`bob` принимает **путь к файлу** с паролем, а не сам пароль: параметры
+`--keystore-pass` и `--key-pass` указывают на файл, в который workflow пишет
+`ANDROID_KEYSTORE_PASSWORD`. Каталог `docker/android/` (ключ и файл пароля)
+git-ignored и создаётся заново на каждом деплое.
+
+Создать ключ один раз (и положить в секрет):
+
+```bash
+keytool -genkeypair -v -keystore kvadrok.keystore -alias kvadrok \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -dname "CN=Kvadrok, OU=Game, O=Kvadrok, L=Unknown, ST=Unknown, C=RU"
+base64 -w0 kvadrok.keystore   # → ANDROID_KEYSTORE_BASE64
+```
+
 ## Управление
 
 - Тап по стартовому квадрату в центре (в любую его клетку, не обязательно
@@ -250,7 +311,8 @@ K кубиков»** — сколько кубиков уже убрано с п
   плашек, кнопки и подсветки рядов), кнопка в правом верхнем углу
   (`THEME_BTN_*`) переключает тему и сохраняет выбор в `progress.save_theme()`.
 - [`game.project`](game.project): портретная ориентация 420 × 800, `html5.scale_mode = fit`,
-  `gui.max_count = 2048`.
+  `gui.max_count = 2048`, `android.package = com.comse31.kvadrok` (имя пакета APK,
+  без него `bob` не соберёт Android-бандл).
 - [`input/game.input_binding`](input/game.input_binding): `TOUCH_MULTI` маппится на
   действие `touch`, `MOUSE_BUTTON_1` — на отдельное действие `mouse`. В
   [`on_input()`](main/game.gui_script) способ управления запоминается в
@@ -306,7 +368,7 @@ K кубиков»** — сколько кубиков уже убрано с п
 | --- | --- | --- |
 | [`.github/workflows/fetch-bob.yml`](.github/workflows/fetch-bob.yml) | вручную | Скачать `bob.jar` стабильной версии Defold и приложить к релизу `bob-jar-<sha1>`. |
 | [`.github/workflows/build-bob-image.yml`](.github/workflows/build-bob-image.yml) | вручную | Собрать образ-сборщик (JDK 25 + `bob.jar` + библиотеки X11/GL) и опубликовать в `ghcr.io/<owner>/kvadrok-bob-builder:<sha1>`. |
-| [`.github/workflows/deploy-master.yml`](.github/workflows/deploy-master.yml) | push в `main`, вручную | Собрать HTML5-бандл (`wasm-web`), упаковать в nginx-образ и развернуть контейнер `kvadrok-web` на порту `8098`. |
+| [`.github/workflows/deploy-master.yml`](.github/workflows/deploy-master.yml) | push в `main`, вручную | Собрать HTML5-бандл (`wasm-web`), собрать и подписать APK (`arm64-android`), вложить его в бандл как `download/kvadrok.apk`, упаковать в nginx-образ и развернуть контейнер `kvadrok-web` на порту `8098`. |
 
 ### Первичная настройка (один раз)
 
@@ -328,6 +390,19 @@ K кубиков»** — сколько кубиков уже убрано с п
 
 После этого каждый push в `main` собирает и переразворачивает игру:
 `http://<хост-раннера>:8098/`.
+
+### Секреты репозитория (один раз)
+
+`Settings → Secrets and variables → Actions` — добавить:
+
+| Секрет | Назначение |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | `.keystore` в base64 — ключ подписи APK (см. [Android-дистрибутив](#android-дистрибутив)). |
+| `ANDROID_KEYSTORE_PASSWORD` | Пароль хранилища и ключа (alias `kvadrok`). |
+
+Без первого секрета деплой не падает, но создаёт временный ключ: APK
+устанавливается, однако обновление поверх предыдущей версии Android
+отклонит.
 
 ### Локальная проверка в Docker
 
@@ -354,7 +429,35 @@ docker run --rm -p 8098:80 kvadrok-web:test
 ```
 
 `docker/nginx.conf` отдаёт `.wasm` с `Content-Type: application/wasm` (без
-этого браузер не запускает движок) и сжимает `.js`/`.html`.
+этого браузер не запускает движок), сжимает `.js`/`.html` и отдаёт APK по
+`/download/kvadrok.apk` с MIME `application/vnd.android.package-archive` и
+`Content-Disposition: attachment`.
+
+Собрать APK локально (ключ и файл пароля — в `docker/android/`, каталог
+git-ignored):
+
+```bash
+mkdir -p docker/android
+keytool -genkeypair -v -keystore docker/android/kvadrok.keystore -alias kvadrok \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -dname "CN=Kvadrok, OU=Game, O=Kvadrok, L=Unknown, ST=Unknown, C=RU" \
+  -storepass kvadrokpass -keypass kvadrokpass
+printf '%s' kvadrokpass > docker/android/kvadrok.pass
+
+# Только arm64: движок для armv7/x86_64 в bob.jar отсутствует,
+# и bob полез бы за ним на медленный d.defold.com.
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD":/project -w /project kvadrok-bob-builder:25-jdk \
+  java -jar /opt/bob/bob.jar --root . --platform arm64-android \
+    --architectures arm64-android --variant release \
+    --bundle-output dist/android \
+    --keystore docker/android/kvadrok.keystore \
+    --keystore-pass docker/android/kvadrok.pass \
+    --keystore-alias kvadrok \
+    --key-pass docker/android/kvadrok.pass \
+    resolve build bundle
+# результат: dist/android/kvadrok/kvadrok.apk
+```
 
 Для сборки через Defold API редактора используется
 `POST http://127.0.0.1:<порт>/bob` (порт — в `.internal/editor.port`, токен — в

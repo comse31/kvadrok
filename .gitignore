@@ -13,3 +13,6 @@ builtins
 /kvadrok_progress
 /kvadrok.iml
 .idea/
+# Ключ подписи APK и пароль к нему создаются на этапе деплоя из секретов
+# репозитория (ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD).
+/docker/android/

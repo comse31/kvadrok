@@ -41,6 +41,10 @@ env:
   IMAGE_TAG: latest
   CONTAINER_NAME: kvadrok-web
   HOST_PORT: "8098"
+  # Ключ подписи APK (base64 от .keystore) и его пароль. Пусто — сборка
+  # создаст временный ключ (APK установится, но обновления поверх не встанут).
+  ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+  ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
 
 jobs:
   build-and-deploy:
@@ -179,6 +183,71 @@ jobs:
           test -f dist/web/kvadrok/index.html
           ls -la dist/web/kvadrok
 
+      - name: Сборка APK для Android (arm64) и вложение в web-бандл
+        # Игра распространяется и как веб-страница, и как APK: на Android
+        # страница предлагает скачать дистрибутив (см. шаг правки index.html),
+        # а сам файл отдаётся nginx по пути download/kvadrok.apk.
+        #
+        # Почему только --architectures arm64-android и --platform arm64-android:
+        # в bob.jar движок Android есть ТОЛЬКО для arm64 (libexec/arm64-android/
+        # libdmengine_release.so). Для armv7/x86_64 движков нет, и bob пытается
+        # скачать их с d.defold.com, который на этом хосте троттлится — сборка
+        # «зависает» на этапе Bundling. arm64 покрывает все актуальные Android-
+        # устройства.
+        #
+        # Ключ подписи обязателен и должен быть ОДНИМ И ТЕМ ЖЕ между релизами:
+        # Android отказывается устанавливать обновление APK, подписанное другим
+        # ключом. Ключ берётся из секретов репозитория (base64 от .keystore),
+        # bob ждёт ПАРОЛЬ В ФАЙЛЕ (--keystore-pass/--key-pass — это пути к
+        # файлам с паролем, а не сам пароль).
+        run: |
+          set -euo pipefail
+
+          KS_DIR=docker/android
+          KS_FILE="$KS_DIR/kvadrok.keystore"
+          PASS_FILE="$KS_DIR/kvadrok.pass"
+          mkdir -p "$KS_DIR"
+
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "Ключ подписи: из секрета ANDROID_KEYSTORE_BASE64"
+            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 -d > "$KS_FILE"
+          else
+            echo "::warning::Секрет ANDROID_KEYSTORE_BASE64 не задан — создаю временный ключ."
+            echo "::warning::При смене ключа Android не установит APK поверх предыдущей версии."
+            docker run --rm -v "$PWD/$KS_DIR":/out "${BOB_BUILDER_REF}" \
+              keytool -genkeypair -v -keystore /out/kvadrok.keystore \
+                -alias kvadrok -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass "${ANDROID_KEYSTORE_PASSWORD:-kvadrokpass}" \
+                -keypass "${ANDROID_KEYSTORE_PASSWORD:-kvadrokpass}" \
+                -dname "CN=Kvadrok, OU=Game, O=Kvadrok, L=Unknown, ST=Unknown, C=RU"
+          fi
+          chmod 600 "$KS_FILE"
+          printf '%s' "${ANDROID_KEYSTORE_PASSWORD:-kvadrokpass}" > "$PASS_FILE"
+
+          rm -rf dist/android
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "$PWD":/project \
+            -w /project \
+            "${BOB_BUILDER_REF}" \
+            java -jar /opt/bob/bob.jar \
+              --root . \
+              --platform arm64-android \
+              --architectures arm64-android \
+              --variant release \
+              --bundle-output dist/android \
+              --keystore "$KS_FILE" \
+              --keystore-pass "$PASS_FILE" \
+              --keystore-alias kvadrok \
+              --key-pass "$PASS_FILE" \
+              resolve build bundle
+
+          test -f dist/android/kvadrok/kvadrok.apk
+          mkdir -p dist/web/kvadrok/download
+          cp dist/android/kvadrok/kvadrok.apk dist/web/kvadrok/download/kvadrok.apk
+          ls -lh dist/web/kvadrok/download/kvadrok.apk
+
       - name: Подстановка версии игры в index.html
         # Рядом с бейджем «Made with Defold» показываем версию игры и номер
         # сборки:
@@ -225,12 +294,85 @@ jobs:
           html = html.replace(f"<title>kvadrok {version}</title>",
                               f"<title>kvadrok {label}</title>", 1)
 
+          # Маленькая ссылка «скачать для Android» внизу экрана — в том же ряду
+          # кнопок, что Fullscreen и «Made with Defold». Атрибут download
+          # заставляет браузер сохранять файл, а не открывать его.
+          android_link = (
+              '<a class="android-download" href="download/kvadrok.apk" '
+              'download="kvadrok.apk" title="Скачать игру для Android">'
+              'скачать для Android</a>'
+          )
+          buttons = '<div class="button" onclick="Module.toggleFullscreen();">Fullscreen</div>'
+          if buttons not in html:
+              sys.exit(f"В {index} не найден блок кнопок для ссылки на Android")
+          html = html.replace(buttons, buttons + "\n\t\t\t" + android_link, 1)
+
+          # Плашка-предложение установить приложение. Скрыта по умолчанию;
+          # показывается скриптом при заходе с Android-устройства.
+          prompt = (
+              '<div id="android-install-prompt" class="android-prompt" style="display:none">'
+              '<span>Игра доступна как приложение для Android</span>'
+              '<a href="download/kvadrok.apk" download="kvadrok.apk">Установить</a>'
+              '<button type="button" class="android-prompt-close" '
+              'id="android-install-close" aria-label="Закрыть">&times;</button>'
+              '</div>'
+          )
+          html = html.replace(
+              '<div id="app-container" class="canvas-app-container">',
+              prompt + '\n\t<div id="app-container" class="canvas-app-container">', 1)
+
+          # Стили — перед закрывающим тегом стилей. Строки склеиваются из
+          # отдельных литералов: многострочные """...""" внутри блока run: |
+          # ломают YAML (их строки не выровнены под отступ шага).
+          styles = (
+              "\n"
+              "\t.android-download { font-size: 12px; margin-left: 12px; opacity: 0.8; }\n"
+              "\t.android-download:hover { opacity: 1; }\n"
+              "\t.android-prompt { position: fixed; left: 0; right: 0; bottom: 0;"
+              " z-index: 10; display: none; align-items: center; gap: 8px;"
+              " padding: 8px 12px; background: #1a72eb; color: #fff;"
+              " font-family: sans-serif; font-size: 13px; }\n"
+              "\t.android-prompt a { margin-left: auto; background: #fff;"
+              " color: #006fff; border-radius: 4px; padding: 4px 10px;"
+              " font-weight: 600; }\n"
+              "\t.android-prompt-close { background: none; border: 0; color: #fff;"
+              " font-size: 20px; line-height: 1; cursor: pointer; }\n"
+          )
+          html = html.replace("\n\t</style>", styles + "\t</style>", 1)
+
+          # Скрипт показа плашки на Android и закрытия по крестику. Факт
+          # закрытия запоминается в localStorage, чтобы не предлагать установку
+          # при каждом заходе (например, когда приложение уже установлено).
+          script = (
+              "<script>\n"
+              "\t(function () {\n"
+              '\t\tvar KEY = "kvadrok_android_prompt_dismissed";\n'
+              '\t\tvar prompt = document.getElementById("android-install-prompt");\n'
+              "\t\tif (!prompt) return;\n"
+              "\t\tif (!/Android/i.test(navigator.userAgent)) return;\n"
+              "\t\tvar dismissed = false;\n"
+              '\t\ttry { dismissed = localStorage.getItem(KEY) === "1"; } catch (e) {}\n'
+              "\t\tif (dismissed) return;\n"
+              '\t\tprompt.style.display = "flex";\n'
+              '\t\tvar close = document.getElementById("android-install-close");\n'
+              "\t\tif (close) {\n"
+              '\t\t\tclose.addEventListener("click", function () {\n'
+              '\t\t\t\tprompt.style.display = "none";\n'
+              '\t\t\t\ttry { localStorage.setItem(KEY, "1"); } catch (e) {}\n'
+              "\t\t\t});\n"
+              "\t\t}\n"
+              "\t})();\n"
+              "</script>\n"
+          )
+          html = html.replace("</body>", script + "</body>", 1)
+
           with open(index, "w", encoding="utf-8") as f:
               f.write(html)
           print("index.html обновлён")
           PY
 
           grep -o 'build-version[^<]*</span>' "$INDEX" || true
+          grep -o 'android-download[^>]*>[^<]*' "$INDEX" || true
 
       - name: Остановка и удаление старого контейнера
         run: |
