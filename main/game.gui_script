@@ -1636,6 +1636,11 @@ local THEME_BTN_MARGIN_R = 0.035 -- доля ширины сцены
 local THEME_BTN_MARGIN_T = 0.022 -- доля высоты сцены
 local THEME_BTN_FONT = 0.66
 
+-- На тач-экране отложенное нажатие кнопки темы ждёт настоящий touch-дубль.
+-- Если дубль не пришёл (мышь на устройстве с тачскрином), нажатие всё равно
+-- применяется по истечении этой задержки.
+local THEME_PENDING_DELAY = 0.12
+
 --- Удаляет узлы кнопки переключения темы.
 local function clear_theme_button(self)
 	if self.theme_btn then
@@ -2366,6 +2371,10 @@ function init(self)
 	-- включается независимо от того, какое событие пришло раньше.
 	self.input_mode = nil
 	self.touch_screen = detect_touch_screen()
+	-- Отложенное нажатие кнопки темы: на тач-экране mouse-дубль касания не
+	-- должен переключать тему — ждём настоящий touch-дубль (см. on_input/update).
+	self.theme_pending = nil
+	self.theme_touch_active = nil
 	self.drag = nil
 	self.return_anim = nil
 	self.land_anim = nil
@@ -2522,6 +2531,17 @@ local function update_move_anim(self, dt)
 end
 
 function update(self, dt)
+	-- Отложенное нажатие кнопки темы (см. on_input): на тач-экране mouse-клик
+	-- ждёт настоящий touch-дубль, чтобы тема не переключилась дважды. Если дубль
+	-- не пришёл, применяем нажатие по таймауту.
+	if self.theme_pending then
+		self.theme_pending = self.theme_pending - dt
+		if self.theme_pending <= 0 then
+			self.theme_pending = nil
+			toggle_theme(self)
+		end
+	end
+
 	-- Призовые кубики переливаются и блестят постоянно, независимо от
 	-- остальных анимаций; собранные — улетают в центр.
 	update_bonus_anim(self, dt)
@@ -2666,10 +2686,38 @@ function on_input(self, action_id, action)
 	-- поведение захвата могут от него зависеть.
 	self.input_mode = (is_mouse and not self.touch_screen) and "mouse" or "touch"
 
+	-- Отпускание настоящего касания снимает признак «идёт touch-нажатие».
+	if action.released and has_touch_points then
+		self.theme_touch_active = nil
+	end
+
 	-- Кнопка переключения темы работает всегда, даже во время анимаций и
 	-- после окончания партии: это настройка оформления, а не игровое действие.
+	--
+	-- На сенсорных устройствах движок дублирует каждое касание mouse-событием:
+	-- одно физическое нажатие приходит дважды (mouse и touch) с одинаковыми
+	-- координатами. Переключение темы — дискретное действие, поэтому второй
+	-- дубль возвращал бы тему обратно, и кнопка «не работала» бы. Поэтому
+	-- mouse-нажатие по кнопке не применяем сразу: оно ждёт настоящий
+	-- touch-дубль (тот отменяет ожидание и переключает тему ровно один раз),
+	-- а если дубль не придёт — при обычном клике мышью — нажатие применится
+	-- по таймауту в update(). Признак theme_touch_active гасит mouse-дубль и
+	-- в случае, когда движок присылает touch раньше mouse.
 	if action.pressed and theme_button_hit(self, action) then
-		toggle_theme(self)
+		if is_mouse and not has_touch_points then
+			-- Мышиное нажатие: на тач-устройстве это, скорее всего, первый дубль
+			-- касания. Не применяем сразу — ждём touch-дубль; если его не будет
+			-- (обычный клик мышью), нажатие применится по таймауту в update().
+			if not self.theme_touch_active then
+				self.theme_pending = THEME_PENDING_DELAY
+			end
+		else
+			-- Настоящее касание: отменяем отложенное нажатие и переключаем тему
+			-- один раз. theme_touch_active гасит возможный mouse-дубль после этого.
+			self.theme_pending = nil
+			self.theme_touch_active = true
+			toggle_theme(self)
+		end
 		return true
 	end
 
