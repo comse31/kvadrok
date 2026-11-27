@@ -251,8 +251,14 @@ K кубиков»** — сколько кубиков уже убрано с п
   (`THEME_BTN_*`) переключает тему и сохраняет выбор в `progress.save_theme()`.
 - [`game.project`](game.project): портретная ориентация 420 × 800, `html5.scale_mode = fit`,
   `gui.max_count = 2048`.
-- [`input/game.input_binding`](input/game.input_binding): `TOUCH_MULTI` и `MOUSE_BUTTON_1`,
-  оба маппятся на действие `touch`.
+- [`input/game.input_binding`](input/game.input_binding): `TOUCH_MULTI` маппится на
+  действие `touch`, `MOUSE_BUTTON_1` — на отдельное действие `mouse`. В
+  [`on_input()`](main/game.gui_script) способ управления запоминается в
+  `self.input_mode` (`"touch"` или `"mouse"`) по последнему событию.
+- [`main/game.gui_script`](main/game.gui_script): `DRAG_LIFT_R` / `DRAG_LIFT_MIN_CELLS` —
+  насколько деталь поднимается над пальцем при захвате. Подъём применяется только
+  для касания (иначе палец закрывает деталь); при управлении мышью деталь
+  остаётся под курсором без смещения.
 
 ## Запуск
 
