@@ -25,6 +25,7 @@ show_fullscreen_button = 1
 
 [android]
 input_method = HiddenInputField
+package = com.comse31.kvadrok
 
 [project]
 title = kvadrok

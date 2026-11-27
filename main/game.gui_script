@@ -75,6 +75,57 @@ local DRAG_LIFT_MIN_CELLS = 2
 local ACTION_TOUCH = hash("touch")
 local ACTION_MOUSE = hash("mouse")
 
+-- Системы, где ввод заведомо идёт с сенсорного экрана. На Android и iOS движок
+-- дублирует каждое касание эмулированным mouse-событием, причём mouse может
+-- прийти первым. Определять способ управления только по action_id тогда нельзя:
+-- деталь захватилась бы «мышиной» веткой и осталась бы без подъёма из-под пальца.
+local TOUCH_SYSTEMS = {
+	Android = true,
+	["iPhone OS"] = true,
+	["iPadOS"] = true,
+	iOS = true,
+}
+
+-- Проверка сенсорного экрана в браузере: у мобильных устройств есть либо
+-- несколько точек касания, либо «грубый» указатель (палец вместо курсора).
+local HTML5_TOUCH_CHECK = [[
+	(function() {
+		if (navigator.maxTouchPoints > 0) return "1";
+		if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) return "1";
+		return "0";
+	})()
+]]
+
+local function system_name()
+	if not sys or not sys.get_sys_info then
+		return nil
+	end
+	local ok, info = pcall(sys.get_sys_info)
+	if not ok or not info then
+		return nil
+	end
+	return info.system_name
+end
+
+--- Устройство с сенсорным экраном: подъём детали нужен всегда.
+local function detect_touch_screen()
+	local name = system_name()
+	if TOUCH_SYSTEMS[name] == true then
+		return true
+	end
+	-- В браузере платформа одна и та же на десктопе и на телефоне, поэтому
+	-- сенсорность определяется через JS. html5.run выполняет код синхронно
+	-- и сразу отдаёт результат в колбэк.
+	if name == "HTML5" and html5 and html5.run then
+		local result = "0"
+		pcall(html5.run, HTML5_TOUCH_CHECK, function(value)
+			result = value
+		end)
+		return result == "1"
+	end
+	return false
+end
+
 -- Призовые кубики. В жёлтой и красной фазе (контур стартового квадрата
 -- жёлтый или красный) каждые BONUS_INTERVAL ходов в случайной заполненной
 -- ячейке появляется золотой или серебряный кубик. Он переливается и блестит
@@ -2286,8 +2337,10 @@ function init(self)
 	self.fill_target = 0
 	self.shown_removed = nil
 	-- Способ управления ("touch" или "mouse") определяется по первому
-	-- событию ввода в on_input().
+	-- событию ввода в on_input(). На сенсорных платформах подъём детали
+	-- включается независимо от того, какое событие пришло раньше.
 	self.input_mode = nil
+	self.touch_screen = detect_touch_screen()
 	self.drag = nil
 	self.return_anim = nil
 	self.land_anim = nil
@@ -2573,7 +2626,7 @@ function on_input(self, action_id, action)
 
 	-- Запоминаем способ управления по последнему событию: подсказки и
 	-- поведение захвата могут от него зависеть.
-	self.input_mode = is_mouse and "mouse" or "touch"
+	self.input_mode = (is_mouse and not self.touch_screen) and "mouse" or "touch"
 
 	-- Кнопка переключения темы работает всегда, даже во время анимаций и
 	-- после окончания партии: это настройка оформления, а не игровое действие.
@@ -2648,8 +2701,10 @@ function on_input(self, action_id, action)
 		-- следует за пальцем с постоянным отступом. Подъём не квантуется,
 		-- так что деталь не дёргается при захвате. При управлении мышью
 		-- подъём не нужен: курсор деталь не закрывает.
+		-- На сенсорных платформах (Android/iOS) подъём включаем всегда: движок
+		-- дублирует касание mouse-событием, и первым может прийти именно оно.
 		local lift = 0
-		if is_touch then
+		if is_touch or self.touch_screen then
 			lift = math.max(DRAG_LIFT_MIN_CELLS, BASE_H * DRAG_LIFT_R / self.cell)
 			lift = math.min(lift, game.H - piece.h - piece.y)
 			if lift < 0 then
