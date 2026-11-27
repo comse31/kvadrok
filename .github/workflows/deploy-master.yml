@@ -312,18 +312,19 @@ jobs:
           html = html.replace(f"<title>kvadrok {version}</title>",
                               f"<title>kvadrok {label}</title>", 1)
 
-          # Маленькая ссылка «скачать для Android» внизу экрана — в том же ряду
-          # кнопок, что Fullscreen и «Made with Defold». Атрибут download
-          # заставляет браузер сохранять файл, а не открывать его.
+          # Ссылка «скачать для Android» — вверху экрана, отдельным фиксированным
+          # элементом. Слева, а не справа: правый верхний угол сцены занят
+          # кнопкой переключения темы. Атрибут download заставляет браузер
+          # сохранять файл, а не открывать его.
           android_link = (
               '<a class="android-download" href="download/kvadrok.apk" '
               'download="kvadrok.apk" title="Скачать игру для Android">'
               'скачать для Android</a>'
           )
-          buttons = '<div class="button" onclick="Module.toggleFullscreen();">Fullscreen</div>'
-          if buttons not in html:
-              sys.exit(f"В {index} не найден блок кнопок для ссылки на Android")
-          html = html.replace(buttons, buttons + "\n\t\t\t" + android_link, 1)
+          body_tag = "<body>"
+          if body_tag not in html:
+              sys.exit(f"В {index} не найден тег <body> для ссылки на Android")
+          html = html.replace(body_tag, body_tag + "\n\t" + android_link, 1)
 
           # Плашка-предложение установить приложение. Скрыта по умолчанию;
           # показывается скриптом при заходе с Android-устройства.
@@ -344,7 +345,10 @@ jobs:
           # ломают YAML (их строки не выровнены под отступ шага).
           styles = (
               "\n"
-              "\t.android-download { font-size: 12px; margin-left: 12px; opacity: 0.8; }\n"
+              "\t.android-download { position: fixed; top: 8px; left: 12px;"
+              " z-index: 10; font-family: sans-serif; font-size: 12px;"
+              " padding: 4px 8px; border-radius: 4px; background: #ffffff;"
+              " box-shadow: 0 1px 4px rgba(21, 36, 74, 0.18); opacity: 0.9; }\n"
               "\t.android-download:hover { opacity: 1; }\n"
               "\t.android-prompt { position: fixed; left: 0; right: 0; bottom: 0;"
               " z-index: 10; display: none; align-items: center; gap: 8px;"
