@@ -58,18 +58,19 @@ jobs:
         # bob в контейнере-сборщике пишет артефакты (.internal/, build/, dist/)
         # прямо в смонтированный workspace. Если контейнер работал под root, эти
         # каталоги остаются root-owned, и actions/checkout не может очистить
-        # workspace (EACCES). Все они git-ignored и пересоздаются на этой же
-        # сборке, поэтому удаляем их из контейнера под root ДО checkout.
+        # workspace (EACCES). То же с docker/android/ (ключ подписи APK в старых
+        # запусках создавался root-owned). Все они git-ignored и пересоздаются на
+        # этой же сборке, поэтому удаляем их из контейнера под root ДО checkout.
         run: |
           set -euo pipefail
           found=""
-          for d in .internal build dist; do
+          for d in .internal build dist docker/android; do
             [ -e "$d" ] && found="$found $d"
           done
           if [ -n "$found" ]; then
             echo "Найдены остатки:$found — удаляю через контейнер под root"
             docker run --rm -v "$PWD":/project alpine \
-              sh -c 'rm -rf /project/.internal /project/build /project/dist'
+              sh -c 'rm -rf /project/.internal /project/build /project/dist /project/docker/android'
           else
             echo "Остатков нет — пропускаю"
           fi
@@ -208,13 +209,30 @@ jobs:
           PASS_FILE="$KS_DIR/kvadrok.pass"
           mkdir -p "$KS_DIR"
 
+          # Ключ мог остаться от предыдущей сборки root-owned (keytool раньше
+          # запускался в контейнере под root). Тогда обычный chmod/перезапись от
+          # пользователя раннера падают с EPERM. Удаляем остатки: если как
+          # пользователь не выходит — через контейнер под root (каталог
+          # docker/android внутри workspace и git-ignored).
+          rm -f "$KS_FILE" "$PASS_FILE" 2>/dev/null || true
+          if [ -e "$KS_FILE" ] || [ -e "$PASS_FILE" ]; then
+            echo "Остатки ключа не удалились от пользователя раннера — удаляю через контейнер под root"
+            docker run --rm -v "$PWD/$KS_DIR":/out alpine \
+              rm -f /out/kvadrok.keystore /out/kvadrok.pass
+          fi
+
           if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
             echo "Ключ подписи: из секрета ANDROID_KEYSTORE_BASE64"
             printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 -d > "$KS_FILE"
           else
             echo "::warning::Секрет ANDROID_KEYSTORE_BASE64 не задан — создаю временный ключ."
             echo "::warning::При смене ключа Android не установит APK поверх предыдущей версии."
-            docker run --rm -v "$PWD/$KS_DIR":/out "${BOB_BUILDER_REF}" \
+            # --user раннера: иначе keytool создаёт root-owned файл, и следующий
+            # chmod 600 / удаление при повторной сборке падают с EPERM.
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp \
+              -v "$PWD/$KS_DIR":/out "${BOB_BUILDER_REF}" \
               keytool -genkeypair -v -keystore /out/kvadrok.keystore \
                 -alias kvadrok -keyalg RSA -keysize 2048 -validity 10000 \
                 -storepass "${ANDROID_KEYSTORE_PASSWORD:-kvadrokpass}" \
